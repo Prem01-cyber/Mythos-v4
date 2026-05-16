@@ -12,6 +12,9 @@ accelerate>=0.34.0
 bitsandbytes>=0.44.0
 
 # Inference / eval
+# vLLM must be installed separately — it has its own CUDA build.
+# On the cloud machine run:
+#   pip install vllm
 sentencepiece
 protobuf
 

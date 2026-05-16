@@ -40,8 +40,8 @@ parser.add_argument("--model",       default="outputs/mythos-v4/merged-bf16",
                     help="Path to merged model or adapter directory")
 parser.add_argument("--base",        default=None,
                     help="Base model name (only needed when --model is an adapter)")
-parser.add_argument("--max-tokens",  type=int, default=1024,
-                    help="Max new tokens to generate (default: 1024)")
+parser.add_argument("--max-tokens",  type=int, default=2048,
+                    help="Max new tokens to generate (default: 2048)")
 parser.add_argument("--temperature", type=float, default=0.3,
                     help="Sampling temperature (default: 0.3)")
 parser.add_argument("--interactive", action="store_true",
@@ -50,6 +50,8 @@ parser.add_argument("--case",        type=int, default=None,
                     help="Run only test case N (0-indexed)")
 parser.add_argument("--save",        default=None,
                     help="Save full output to this file path")
+parser.add_argument("--backend",     default="vllm", choices=["vllm", "hf"],
+                    help="Inference backend: vllm (fast, batched) or hf/unsloth (default: vllm)")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -364,51 +366,7 @@ def print_score(s: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-def load_model(model_path: str, base_model: str | None):
-    print(f"\nLoading model from: {model_path}")
-
-    import torch
-
-    is_adapter = (
-        os.path.exists(os.path.join(model_path, "adapter_config.json"))
-    )
-
-    if is_adapter:
-        if base_model is None:
-            # Try to read base from adapter_config.json
-            cfg_path = os.path.join(model_path, "adapter_config.json")
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-            base_model = cfg.get("base_model_name_or_path", "Qwen/Qwen2.5-Coder-14B-Instruct")
-        print(f"  Mode: adapter  (base={base_model})")
-        from unsloth import FastLanguageModel
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name     = base_model,
-            max_seq_length = 2048,
-            dtype          = torch.bfloat16,
-            load_in_4bit   = False,
-        )
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, model_path)
-    else:
-        print(f"  Mode: merged model")
-        from unsloth import FastLanguageModel
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name     = model_path,
-            max_seq_length = 2048,
-            dtype          = torch.bfloat16,
-            load_in_4bit   = False,
-        )
-
-    FastLanguageModel.for_inference(model)
-    print(f"  VRAM: {__import__('torch').cuda.memory_allocated() / 1e9:.1f} GB")
-    return model, tokenizer
-
-
-# ---------------------------------------------------------------------------
-# Generation
+# System prompt (shared by both backends)
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
     "You are an expert exploit developer. When given a vulnerability, "
@@ -416,34 +374,132 @@ SYSTEM_PROMPT = (
 )
 
 
-def generate(model, tokenizer, user_content: str,
-             max_new_tokens: int = 1024, temperature: float = 0.3) -> str:
+# ---------------------------------------------------------------------------
+# vLLM backend  (default — fast, batched)
+# ---------------------------------------------------------------------------
+def load_vllm(model_path: str, base_model: str | None):
+    """Load via vLLM. Adapters must be merged first; pass merged-bf16 path."""
+    from vllm import LLM
+
+    is_adapter = os.path.exists(os.path.join(model_path, "adapter_config.json"))
+    if is_adapter:
+        if base_model is None:
+            cfg_path = os.path.join(model_path, "adapter_config.json")
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            base_model = cfg.get("base_model_name_or_path", "Qwen/Qwen2.5-Coder-14B-Instruct")
+        print(f"\nLoading vLLM — adapter detected.")
+        print(f"  Adapter path : {model_path}")
+        print(f"  Base model   : {base_model}")
+        print(f"  Tip: for vLLM prefer the merged model (outputs/mythos-v4/merged-bf16)")
+        llm = LLM(
+            model            = base_model,
+            enable_lora      = True,
+            max_lora_rank    = 64,
+            dtype            = "bfloat16",
+            max_model_len    = 4096,
+            gpu_memory_utilization = 0.90,
+        )
+        # LoRA requests are attached per-call in generate_vllm
+        return llm, {"lora_path": model_path}
+    else:
+        print(f"\nLoading vLLM — merged model: {model_path}")
+        llm = LLM(
+            model            = model_path,
+            dtype            = "bfloat16",
+            max_model_len    = 4096,
+            gpu_memory_utilization = 0.90,
+        )
+        return llm, {}
+
+
+def generate_batch_vllm(llm, meta: dict, prompts: list[str],
+                        max_new_tokens: int = 2048,
+                        temperature: float = 0.3) -> list[str]:
+    """Generate all prompts in a single batched call. Returns list of strings."""
+    from vllm import SamplingParams
+    from vllm.lora.request import LoRARequest
+
+    sampling = SamplingParams(
+        temperature        = temperature,
+        top_p              = 0.9,
+        max_tokens         = max_new_tokens,
+        repetition_penalty = 1.1,
+    )
+
+    # Build chat message lists — vLLM applies the chat template automatically
+    conversations = [
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": p},
+        ]
+        for p in prompts
+    ]
+
+    lora_req = None
+    if "lora_path" in meta:
+        lora_req = LoRARequest("mythos-adapter", 1, meta["lora_path"])
+
+    outputs = llm.chat(conversations, sampling_params=sampling, lora_request=lora_req)
+    return [o.outputs[0].text for o in outputs]
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace / Unsloth backend  (fallback, sequential)
+# ---------------------------------------------------------------------------
+def load_hf(model_path: str, base_model: str | None):
+    import torch
+    from unsloth import FastLanguageModel
+
+    is_adapter = os.path.exists(os.path.join(model_path, "adapter_config.json"))
+    if is_adapter:
+        if base_model is None:
+            cfg_path = os.path.join(model_path, "adapter_config.json")
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+            base_model = cfg.get("base_model_name_or_path", "Qwen/Qwen2.5-Coder-14B-Instruct")
+        print(f"\nLoading HF — adapter  (base={base_model})")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=base_model, max_seq_length=4096,
+            dtype=torch.bfloat16, load_in_4bit=False,
+        )
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, model_path)
+    else:
+        print(f"\nLoading HF — merged model: {model_path}")
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_path, max_seq_length=4096,
+            dtype=torch.bfloat16, load_in_4bit=False,
+        )
+
+    FastLanguageModel.for_inference(model)
+    print(f"  VRAM: {__import__('torch').cuda.memory_allocated() / 1e9:.1f} GB")
+    return model, tokenizer
+
+
+def generate_hf(model, tokenizer, user_content: str,
+                max_new_tokens: int = 2048, temperature: float = 0.3) -> str:
     import torch
 
     messages = [
-        {"role": "system",    "content": SYSTEM_PROMPT},
-        {"role": "user",      "content": user_content},
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": user_content},
     ]
-
     input_ids = tokenizer.apply_chat_template(
-        messages,
-        tokenize             = True,
-        add_generation_prompt = True,
-        return_tensors       = "pt",
+        messages, tokenize=True, add_generation_prompt=True, return_tensors="pt",
     ).to("cuda")
 
     with torch.no_grad():
         output_ids = model.generate(
             input_ids,
-            max_new_tokens   = max_new_tokens,
-            temperature      = temperature,
-            do_sample        = temperature > 0,
-            top_p            = 0.9,
+            max_new_tokens     = max_new_tokens,
+            temperature        = temperature,
+            do_sample          = temperature > 0,
+            top_p              = 0.9,
             repetition_penalty = 1.1,
-            pad_token_id     = tokenizer.eos_token_id,
+            pad_token_id       = tokenizer.eos_token_id,
         )
 
-    # Decode only the generated tokens (strip the prompt)
     new_tokens = output_ids[0][input_ids.shape[-1]:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
@@ -571,74 +627,90 @@ def main():
     if args.case is not None:
         cases = [TEST_CASES[args.case]]
 
-    # Prepare output files up front so we can stream results as they generate
-    txt_file  = None
+    # Prepare output files
+    txt_file   = None
     jsonl_file = None
+    raw_path   = None
     if args.save:
         save_path = Path(args.save)
         save_path.parent.mkdir(parents=True, exist_ok=True)
-        raw_path = save_path.with_name(save_path.stem + "_raw.jsonl")
+        raw_path   = save_path.with_name(save_path.stem + "_raw.jsonl")
         txt_file   = open(save_path, "w", encoding="utf-8")
         jsonl_file = open(raw_path,  "w", encoding="utf-8")
-        # Write header to txt
         txt_file.write(f"{'═' * W}\n")
         txt_file.write(f"  Mythos-v4 Inference Eval  |  {len(cases)} test cases  |  "
                        f"{datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-        txt_file.write(f"  max_new_tokens={args.max_tokens}  temperature={args.temperature}\n")
+        txt_file.write(f"  backend={args.backend}  max_new_tokens={args.max_tokens}"
+                       f"  temperature={args.temperature}\n")
         txt_file.write(f"{'═' * W}\n")
 
-    # Load model
-    model, tokenizer = load_model(args.model, args.base)
+    # ── Load model ───────────────────────────────────────────────────────────
+    if args.backend == "vllm":
+        llm, llm_meta = load_vllm(args.model, args.base)
+    else:
+        hf_model, hf_tokenizer = load_hf(args.model, args.base)
 
     print_header(
         f"Mythos-v4 Inference Eval  |  {len(cases)} test cases  |  "
-        f"{datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M')}  |  backend={args.backend}"
     )
 
-    scores_all = []
-    raw_results = []
+    # ── Generate ─────────────────────────────────────────────────────────────
+    scores_all  = []
+    raw_outputs = []
 
-    for i, case in enumerate(cases):
+    if args.backend == "vllm":
+        # Single batched call — all cases at once
+        print(f"\n  Generating {len(cases)} cases in one batch...")
+        raw_outputs = generate_batch_vllm(
+            llm, llm_meta,
+            [c["prompt"] for c in cases],
+            max_new_tokens = args.max_tokens,
+            temperature    = args.temperature,
+        )
+        print("  Done.\n")
+    else:
+        # HF sequential
+        for i, case in enumerate(cases):
+            print(f"  [{i+1}/{len(cases)}] {case['label'][:60]}")
+            raw_outputs.append(generate_hf(
+                hf_model, hf_tokenizer, case["prompt"],
+                max_new_tokens=args.max_tokens,
+                temperature=args.temperature,
+            ))
+
+    # ── Score + display + write ───────────────────────────────────────────────
+    for i, (case, raw_output) in enumerate(zip(cases, raw_outputs)):
         dist_tag = "in-dist" if case["in_distribution"] else "OUT-OF-DIST"
         print_section(f"Case {i+1}/{len(cases)}: {case['label']}  [{dist_tag}]")
         print(f"  Category : {case['category']}")
         print(f"  Prompt   :\n{textwrap.indent(case['prompt'], '    ')}")
 
-        raw_output = generate(
-            model, tokenizer,
-            case["prompt"],
-            max_new_tokens=args.max_tokens,
-            temperature=args.temperature,
-        )
-
         score = score_output(raw_output)
         scores_all.append(score)
-        raw_results.append({"case": case, "output": raw_output, "score": score})
 
-        # Terminal: truncated display as before
+        # Terminal: truncated
         display_output(raw_output, score, truncate=True)
 
-        # File: full untruncated, streamed immediately
+        # File: full untruncated
         if txt_file:
             _write_txt_case(txt_file, i, len(cases), case, raw_output, score)
             txt_file.flush()
         if jsonl_file:
             reasoning_m = re.search(r"<reasoning>(.*?)</reasoning>", raw_output, re.DOTALL)
             code_m      = re.search(r"```python\n(.*?)```", raw_output, re.DOTALL)
-            after_reasoning = ""
-            if reasoning_m:
-                after_reasoning = raw_output[reasoning_m.end():].strip()
+            after_reasoning = raw_output[reasoning_m.end():].strip() if reasoning_m else ""
             jsonl_file.write(json.dumps({
-                "index":          i + 1,
-                "label":          case["label"],
-                "category":       case["category"],
+                "index":           i + 1,
+                "label":           case["label"],
+                "category":        case["category"],
                 "in_distribution": case["in_distribution"],
-                "prompt":         case["prompt"],
-                "raw_output":     raw_output,
-                "reasoning":      reasoning_m.group(1).strip() if reasoning_m else None,
+                "prompt":          case["prompt"],
+                "raw_output":      raw_output,
+                "reasoning":       reasoning_m.group(1).strip() if reasoning_m else None,
                 "after_reasoning": after_reasoning,
-                "code":           code_m.group(1).strip() if code_m else None,
-                "score":          score,
+                "code":            code_m.group(1).strip() if code_m else None,
+                "score":           score,
             }, ensure_ascii=False) + "\n")
             jsonl_file.flush()
 
@@ -704,9 +776,18 @@ def main():
                 if not user_input.strip().endswith("working exploit."):
                     user_input += "\n\nAnalyze this vulnerability and write a working exploit."
 
-                output = generate(model, tokenizer, user_input,
-                                  max_new_tokens=args.max_tokens,
-                                  temperature=args.temperature)
+                if args.backend == "vllm":
+                    output = generate_batch_vllm(
+                        llm, llm_meta, [user_input],
+                        max_new_tokens=args.max_tokens,
+                        temperature=args.temperature,
+                    )[0]
+                else:
+                    output = generate_hf(
+                        hf_model, hf_tokenizer, user_input,
+                        max_new_tokens=args.max_tokens,
+                        temperature=args.temperature,
+                    )
                 score = score_output(output)
                 display_output(output, score, truncate=False)
 
