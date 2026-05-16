@@ -36,8 +36,8 @@ parser.add_argument("--data",    default="processed/exploitdb.jsonl",
                     help="Path to JSONL training file")
 parser.add_argument("--output",  default="outputs/mythos-v4",
                     help="Directory for checkpoints and final adapter")
-parser.add_argument("--epochs",  type=int, default=5,
-                    help="Training epochs (default: 5)")
+parser.add_argument("--epochs",  type=int, default=3,
+                    help="Training epochs (default: 3 — empirically optimal for this dataset)")
 parser.add_argument("--lr",      type=float, default=1e-4,
                     help="Peak learning rate (default: 1e-4)")
 parser.add_argument("--seed",    type=int, default=42)
@@ -57,11 +57,14 @@ MODEL_NAME = MODEL_MAP[args.model]
 MAX_SEQ_LEN   = 2048
 LORA_R        = 64
 LORA_ALPHA    = 128        # = 2 × r (standard scaling)
-LORA_DROPOUT  = 0.05
+LORA_DROPOUT  = 0          # 0 = full Unsloth patching on LoRA matrices (faster).
+                           # Non-zero dropout blocks Unsloth from patching those
+                           # layers, causing a measurable performance hit.
+                           # LoRA regularisation comes from rank constraint, not dropout.
 EVAL_SPLIT    = 0.05       # 5% held-out eval
 BATCH_SIZE    = 4          # per-device
 GRAD_ACCUM    = 4          # effective batch = 16
-WARMUP_RATIO  = 0.05
+WARMUP_STEPS  = 32         # fixed steps — warmup_ratio is deprecated in TRL v5
 
 # Target all attention + MLP projection layers
 LORA_TARGETS = [
@@ -110,7 +113,7 @@ model = FastLanguageModel.get_peft_model(
     r                        = LORA_R,
     target_modules           = LORA_TARGETS,
     lora_alpha               = LORA_ALPHA,
-    lora_dropout             = LORA_DROPOUT,
+    lora_dropout             = LORA_DROPOUT,  # 0 = full Unsloth patching
     bias                     = "none",
     use_gradient_checkpointing = "unsloth",  # Unsloth's optimised GC (30% more VRAM headroom)
     random_state             = args.seed,
@@ -187,7 +190,7 @@ print(f"Training config:")
 print(f"  steps/epoch      : {steps_per_epoch}")
 print(f"  total steps      : {total_steps}")
 print(f"  effective batch  : {BATCH_SIZE * GRAD_ACCUM}")
-print(f"  warmup steps     : {int(total_steps * WARMUP_RATIO)}\n")
+print(f"  warmup steps     : {WARMUP_STEPS}\n")
 
 from trl import SFTTrainer, SFTConfig
 
@@ -206,7 +209,7 @@ training_args = SFTConfig(
     optim                    = "adamw_8bit",
     learning_rate            = args.lr,
     lr_scheduler_type        = "cosine",
-    warmup_ratio             = WARMUP_RATIO,
+    warmup_steps             = WARMUP_STEPS,  # replaces deprecated warmup_ratio
     weight_decay             = 0.01,
     max_grad_norm            = 1.0,
 
