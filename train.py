@@ -47,23 +47,30 @@ from collections import Counter
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--model",   default="14b",
-                    choices=["7b", "14b"],
-                    help="Model size (default: 14b)")
+                    choices=["7b", "14b", "32b"],
+                    help="Model size: 7b/14b → single A100 80GB BF16; "
+                         "32b → 2×A100 80GB BF16 or add --qlora for single A100")
 parser.add_argument("--source",  default=None,
-                    choices=["exploitdb", "htb", "combined"],
+                    choices=["exploitdb", "htb", "vulhub", "attack", "combined"],
                     help="Which dataset to train on. "
-                         "exploitdb → exploit adapter; "
-                         "htb → methodology adapter; "
-                         "combined → ablation only")
+                         "exploitdb → exploit code adapter (3 epochs); "
+                         "htb → pentest methodology adapter (8 epochs); "
+                         "vulhub → CVE exploitation adapter (6 epochs); "
+                         "attack → ATT&CK red team adapter (6 epochs); "
+                         "combined → all sources merged (ablation only)")
 parser.add_argument("--data",    default=None,
                     help="Override dataset path (optional, --source sets this automatically)")
 parser.add_argument("--output",  default=None,
                     help="Override output directory (optional, auto-named from --source)")
-parser.add_argument("--epochs",  type=int, default=3,
-                    help="Training epochs (default: 3)")
+parser.add_argument("--epochs",  type=int, default=None,
+                    help="Training epochs (auto-set per source: exploitdb=3, "
+                         "htb=8, vulhub=6, attack=6; override with this flag)")
 parser.add_argument("--lr",      type=float, default=1e-4,
                     help="Peak learning rate (default: 1e-4)")
 parser.add_argument("--seed",    type=int, default=42)
+parser.add_argument("--qlora",   action="store_true",
+                    help="Use 4-bit NF4 quantized base (QLoRA) — allows 32B on single A100. "
+                         "Avoids precision loss on LoRA updates but base weights are quantized.")
 args = parser.parse_args()
 
 random.seed(args.seed)
@@ -71,34 +78,50 @@ random.seed(args.seed)
 MODEL_MAP = {
     "7b":  "Qwen/Qwen2.5-Coder-7B-Instruct",
     "14b": "Qwen/Qwen2.5-Coder-14B-Instruct",
+    "32b": "Qwen/Qwen2.5-Coder-32B-Instruct",  # ~64GB BF16 — needs 2×A100 or QLoRA on 1×A100
 }
 MODEL_NAME = MODEL_MAP[args.model]
 
-# Source → dataset file + output directory
+# Source → (dataset file, output directory, recommended_epochs)
+# Small datasets (HTB/Vulhub/ATT&CK) need more epochs because the optimizer
+# sees far fewer total gradient steps. Rule of thumb: target ~400 total steps.
+# ExploitDB: 2143 ex / 16 eff_batch × 3 epochs = 402 steps ✓
+# HTB:        188 ex / 16 × 8 epochs  =  94 steps  (small, squeeze more passes)
+# Vulhub:     265 ex / 16 × 6 epochs  = 102 steps
+# ATT&CK:     295 ex / 16 × 6 epochs  = 114 steps
 SOURCE_MAP = {
-    "exploitdb": ("processed/exploitdb.jsonl",  "outputs/mythos-v4-exploitdb"),
-    "htb":       ("raw/htb_writeups.jsonl",      "outputs/mythos-v4-htb"),
-    "combined":  ("processed/combined.jsonl",    "outputs/mythos-v4-combined"),
+    "exploitdb": ("processed/exploitdb.jsonl",  "outputs/mythos-v4-exploitdb", 3),
+    "htb":       ("raw/htb_writeups.jsonl",      "outputs/mythos-v4-htb",       8),
+    "vulhub":    ("raw/vulhub.jsonl",            "outputs/mythos-v4-vulhub",    6),
+    "attack":    ("raw/attack.jsonl",            "outputs/mythos-v4-attack",    6),
+    "combined":  ("processed/combined.jsonl",    "outputs/mythos-v4-combined",  3),
 }
 
 # Resolve source: explicit --source wins; fall back to detecting from --data; else default
 if args.source:
-    _data_default, _out_default = SOURCE_MAP[args.source]
+    _data_default, _out_default, _epoch_default = SOURCE_MAP[args.source]
 elif args.data:
-    # Infer from data path for backwards compat
-    _data_default = args.data
-    _out_default  = "outputs/mythos-v4-custom"
+    _data_default  = args.data
+    _out_default   = "outputs/mythos-v4-custom"
+    _epoch_default = 3
 else:
-    # No --source and no --data → require --source
-    parser.error("Specify --source (exploitdb | htb | combined) to select adapter target.")
+    parser.error("Specify --source (exploitdb | htb | vulhub | attack | combined).")
 
 DATA_PATH   = args.data   or _data_default
 OUTPUT_DIR  = args.output or _out_default
 
+# Override epochs only if user didn't explicitly pass --epochs
+# argparse has no built-in "was this set by user" check, so we use a sentinel:
+# EPOCHS: auto-set from source map unless user explicitly passed --epochs
+if args.epochs is None:
+    EPOCHS = _epoch_default
+else:
+    EPOCHS = args.epochs
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-MAX_SEQ_LEN   = 2048
+MAX_SEQ_LEN   = 3000
 LORA_R        = 64
 LORA_ALPHA    = 128        # = 2 × r (standard scaling)
 LORA_DROPOUT  = 0          # 0 = full Unsloth patching on LoRA matrices (faster).
@@ -126,7 +149,7 @@ print(f"\n{'═'*60}")
 print(f"  Mythos-v4 Fine-tuning  —  Adapter: {args.source or 'custom'}")
 print(f"  Model  : {MODEL_NAME}")
 print(f"  Data   : {DATA_PATH}")
-print(f"  Epochs : {args.epochs}")
+print(f"  Epochs : {EPOCHS}")
 print(f"  LR     : {args.lr}")
 print(f"  Output : {OUTPUT_DIR}")
 print(f"{'═'*60}\n")
@@ -137,14 +160,18 @@ from unsloth import FastLanguageModel
 # ---------------------------------------------------------------------------
 # Load base model — full BF16, no quantization
 # ---------------------------------------------------------------------------
-print(f"Loading {MODEL_NAME} in BF16 (no quantization)...")
+if args.qlora:
+    print(f"Loading {MODEL_NAME} in 4-bit NF4 (QLoRA — single A100 mode)...")
+    print("  Note: base weights quantized to 4-bit; LoRA updates remain in BF16.")
+    print("  Use this only when 2×A100 is unavailable for 32B.\n")
+else:
+    print(f"Loading {MODEL_NAME} in BF16 (full precision)...")
 
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name      = MODEL_NAME,
     max_seq_length  = MAX_SEQ_LEN,
     dtype           = torch.bfloat16,
-    load_in_4bit    = False,   # full precision — A100 80GB has the VRAM
-    # Flash Attention 2 is enabled automatically by Unsloth for supported models
+    load_in_4bit    = args.qlora,  # True only for 32B on single A100
 )
 
 print(f"  Parameters : {sum(p.numel() for p in model.parameters()) / 1e9:.1f}B")
@@ -238,7 +265,7 @@ print(f"  Over {MAX_SEQ_LEN}: {over_limit}/50\n")
 # Training arguments
 # ---------------------------------------------------------------------------
 steps_per_epoch = math.ceil(len(train_dataset) / (BATCH_SIZE * GRAD_ACCUM))
-total_steps     = steps_per_epoch * args.epochs
+total_steps     = steps_per_epoch * EPOCHS
 
 print(f"Training config:")
 print(f"  steps/epoch      : {steps_per_epoch}")
@@ -250,7 +277,7 @@ from trl import SFTTrainer, SFTConfig
 
 training_args = SFTConfig(
     output_dir               = OUTPUT_DIR,
-    num_train_epochs         = args.epochs,
+    num_train_epochs         = EPOCHS,
 
     # Batch
     per_device_train_batch_size = BATCH_SIZE,
