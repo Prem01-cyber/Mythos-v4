@@ -9,11 +9,28 @@ No quantization — full BF16 weights + LoRA adapters.
 Flash Attention is mathematically identical to standard attention;
 no precision loss, just memory efficiency and ~2x speed.
 
+Dataset (combined):
+  processed/exploitdb.jsonl   Source 1 — exploit code + reasoning (2143 examples)
+  raw/htb_writeups.jsonl      Source 2 — HTB multi-turn methodology (174 examples)
+  → combined into processed/combined.jsonl by prepare_data.py
+
+Architecture: Specialized LoRA Adapters (one per source)
+  Each adapter is trained independently from the same frozen base model.
+  This eliminates catastrophic forgetting entirely — base weights never change.
+  Adapters are swapped at inference time based on task type:
+    • Adapter 1 (exploitdb)   → exploit code generation, CVE analysis
+    • Adapter 2 (htb)         → multi-turn pentest methodology, HTB chains
+    • Adapter N (future)      → additional specializations (Source 3, 4, ...)
+
+  --source flag selects which dataset this adapter trains on.
+  Output path automatically namespaced: outputs/mythos-v4-{source}/
+
 Usage:
-    python3 train.py
-    python3 train.py --model 7b          # use 7B instead
-    python3 train.py --epochs 3          # override epoch count
-    python3 train.py --output outputs/run1
+    python3 train.py --source exploitdb     # Adapter 1 — exploit code
+    python3 train.py --source htb           # Adapter 2 — pentest methodology
+    python3 train.py --source combined      # combined (for ablation comparison)
+    python3 train.py --model 7b --source htb
+    python3 train.py --epochs 5 --source exploitdb
 """
 
 import os
@@ -32,12 +49,18 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--model",   default="14b",
                     choices=["7b", "14b"],
                     help="Model size (default: 14b)")
-parser.add_argument("--data",    default="processed/exploitdb.jsonl",
-                    help="Path to JSONL training file")
-parser.add_argument("--output",  default="outputs/mythos-v4",
-                    help="Directory for checkpoints and final adapter")
+parser.add_argument("--source",  default=None,
+                    choices=["exploitdb", "htb", "combined"],
+                    help="Which dataset to train on. "
+                         "exploitdb → exploit adapter; "
+                         "htb → methodology adapter; "
+                         "combined → ablation only")
+parser.add_argument("--data",    default=None,
+                    help="Override dataset path (optional, --source sets this automatically)")
+parser.add_argument("--output",  default=None,
+                    help="Override output directory (optional, auto-named from --source)")
 parser.add_argument("--epochs",  type=int, default=3,
-                    help="Training epochs (default: 3 — empirically optimal for this dataset)")
+                    help="Training epochs (default: 3)")
 parser.add_argument("--lr",      type=float, default=1e-4,
                     help="Peak learning rate (default: 1e-4)")
 parser.add_argument("--seed",    type=int, default=42)
@@ -50,6 +73,27 @@ MODEL_MAP = {
     "14b": "Qwen/Qwen2.5-Coder-14B-Instruct",
 }
 MODEL_NAME = MODEL_MAP[args.model]
+
+# Source → dataset file + output directory
+SOURCE_MAP = {
+    "exploitdb": ("processed/exploitdb.jsonl",  "outputs/mythos-v4-exploitdb"),
+    "htb":       ("raw/htb_writeups.jsonl",      "outputs/mythos-v4-htb"),
+    "combined":  ("processed/combined.jsonl",    "outputs/mythos-v4-combined"),
+}
+
+# Resolve source: explicit --source wins; fall back to detecting from --data; else default
+if args.source:
+    _data_default, _out_default = SOURCE_MAP[args.source]
+elif args.data:
+    # Infer from data path for backwards compat
+    _data_default = args.data
+    _out_default  = "outputs/mythos-v4-custom"
+else:
+    # No --source and no --data → require --source
+    parser.error("Specify --source (exploitdb | htb | combined) to select adapter target.")
+
+DATA_PATH   = args.data   or _data_default
+OUTPUT_DIR  = args.output or _out_default
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -79,11 +123,12 @@ import torch
 from datasets import Dataset
 
 print(f"\n{'═'*60}")
-print(f"  Mythos-v4 Fine-tuning")
+print(f"  Mythos-v4 Fine-tuning  —  Adapter: {args.source or 'custom'}")
 print(f"  Model  : {MODEL_NAME}")
+print(f"  Data   : {DATA_PATH}")
 print(f"  Epochs : {args.epochs}")
 print(f"  LR     : {args.lr}")
-print(f"  Output : {args.output}")
+print(f"  Output : {OUTPUT_DIR}")
 print(f"{'═'*60}\n")
 
 print("Loading Unsloth...")
@@ -130,22 +175,31 @@ print(f"  VRAM after LoRA: {torch.cuda.memory_allocated() / 1e9:.1f} GB\n")
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-print(f"Loading dataset from {args.data}...")
+print(f"Loading dataset from {DATA_PATH}...")
 
-with open(args.data) as f:
+with open(DATA_PATH) as f:
     raw = [json.loads(l) for l in f if l.strip()]
 
 # Shuffle with fixed seed for reproducibility
 random.shuffle(raw)
 
-# Log category distribution before split
-cats = Counter(e["metadata"].get("category", "unknown") for e in raw)
+# Log source + category distribution before split
+from collections import defaultdict
+sources = Counter(e["metadata"].get("source", "unknown") for e in raw)
+cats    = Counter(e["metadata"].get("category", "unknown") for e in raw)
+
 print(f"  Total examples : {len(raw)}")
-print(f"  Categories     : {len(cats)}")
-print("  Distribution   :")
+print()
+print("  Source breakdown:")
+for src, n in sources.most_common():
+    bar = "█" * int(20 * n / max(sources.values()))
+    print(f"    {src:<25} {n:>5}  {bar}")
+
+print()
+print("  Category distribution:")
 for cat, n in sorted(cats.items()):
     bar = "█" * int(20 * n / max(cats.values()))
-    print(f"    {cat:<32} {n:>4}  {bar}")
+    print(f"    {cat:<35} {n:>4}  {bar}")
 
 # Train / eval split
 split_idx  = int(len(raw) * (1 - EVAL_SPLIT))
@@ -195,7 +249,7 @@ print(f"  warmup steps     : {WARMUP_STEPS}\n")
 from trl import SFTTrainer, SFTConfig
 
 training_args = SFTConfig(
-    output_dir               = args.output,
+    output_dir               = OUTPUT_DIR,
     num_train_epochs         = args.epochs,
 
     # Batch
