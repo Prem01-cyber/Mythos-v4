@@ -472,31 +472,94 @@ def truncate_for_display(text: str, max_chars: int = 800) -> str:
     return text[:max_chars] + f"\n  ... [{len(text) - max_chars} more chars] ..."
 
 
-def display_output(output: str, score: dict) -> None:
+def display_output(output: str, score: dict, truncate: bool = True) -> None:
+    """Print a case output to stdout. When truncate=False, show the full text."""
     reasoning_m = re.search(r"<reasoning>(.*?)</reasoning>", output, re.DOTALL)
     code_m      = re.search(r"```python\n(.*?)```", output, re.DOTALL)
 
+    cap = truncate_for_display if truncate else (lambda t, **_: t)
+
     if reasoning_m:
         print("\n  [REASONING]")
-        print(textwrap.indent(
-            truncate_for_display(reasoning_m.group(1).strip()),
-            "    "
-        ))
+        print(textwrap.indent(cap(reasoning_m.group(1).strip()), "    "))
     else:
-        print("\n  [NO <reasoning> TAG FOUND]")
-        print(textwrap.indent(truncate_for_display(output), "    "))
+        print("\n  [NO <reasoning> TAG FOUND — RAW OUTPUT BELOW]")
+        print(textwrap.indent(cap(output), "    "))
 
     if code_m:
         print("\n  [PYTHON CODE]")
-        print(textwrap.indent(
-            truncate_for_display(code_m.group(1).strip(), max_chars=600),
-            "    "
-        ))
+        print(textwrap.indent(cap(code_m.group(1).strip(), max_chars=600), "    "))
     else:
-        print("\n  [NO ```python BLOCK FOUND]")
+        # When not truncating (file mode), show everything after </reasoning>
+        # so we can see if the model generated partial code or stopped cleanly.
+        if not truncate:
+            after_reasoning = output
+            if reasoning_m:
+                after_reasoning = output[reasoning_m.end():].strip()
+            if after_reasoning:
+                print("\n  [AFTER </reasoning> — no ```python block found]")
+                print(textwrap.indent(after_reasoning, "    "))
+            else:
+                print("\n  [NOTHING after </reasoning>]")
+        else:
+            print("\n  [NO ```python BLOCK FOUND]")
 
     print()
     print_score(score)
+
+
+# ---------------------------------------------------------------------------
+# File output helpers (full, untruncated)
+# ---------------------------------------------------------------------------
+
+def _write_txt_case(f, i: int, n: int, case: dict, raw_output: str, score: dict) -> None:
+    """Write one case to an open file handle, fully untruncated."""
+    dist_tag = "in-dist" if case["in_distribution"] else "OUT-OF-DIST"
+    sep = "─" * W
+    f.write(f"\n{sep}\n")
+    f.write(f"  Case {i+1}/{n}: {case['label']}  [{dist_tag}]\n")
+    f.write(f"{sep}\n")
+    f.write(f"  Category : {case['category']}\n")
+    f.write(f"  Prompt   :\n{textwrap.indent(case['prompt'], '    ')}\n\n")
+    f.write(f"  ── RAW MODEL OUTPUT ({'%d chars' % len(raw_output)}) ──\n\n")
+    # Write the complete, untruncated model output indented for readability
+    f.write(textwrap.indent(raw_output, "  "))
+    f.write("\n\n")
+    # Score summary
+    stars = "★" * score["score"] + "☆" * (score["max_score"] - score["score"])
+    f.write(f"  Score: {score['score']}/{score['max_score']}  {stars}\n")
+    for k in ("has_reasoning_tag", "has_python_block", "no_refusal",
+              "not_truncated", "reasoning_chars", "code_chars"):
+        v = not score["reasoning_truncated"] if k == "not_truncated" else score.get(k)
+        f.write(f"  {k:<22}: {v}\n")
+    f.write("\n")
+
+
+def _write_aggregate_txt(f, cases, scores_all) -> None:
+    n = len(scores_all)
+    f.write(f"\n{'═' * W}\n  AGGREGATE RESULTS\n{'═' * W}\n")
+    f.write(f"  Cases run : {n}\n")
+    f.write(f"  Avg score : {sum(s['score'] for s in scores_all)/n:.2f} / 7\n\n")
+    metrics = {
+        "has_reasoning_tag":  sum(s["has_reasoning_tag"]  for s in scores_all),
+        "has_python_block":   sum(s["has_python_block"]   for s in scores_all),
+        "all_5_sections":     sum(s["sections_count"] == 5 for s in scores_all),
+        "no_refusal":         sum(s["no_refusal"]         for s in scores_all),
+        "not_truncated":      sum(not s["reasoning_truncated"] for s in scores_all),
+        "substantial_code":   sum(s["code_chars"] > 100   for s in scores_all),
+    }
+    for metric, count in metrics.items():
+        bar = "▓" * int(20 * count / n) + "░" * (20 - int(20 * count / n))
+        f.write(f"  {metric:<22} {count:>3}/{n}  [{bar}]\n")
+    f.write(f"\n  Avg reasoning : {sum(s['reasoning_chars'] for s in scores_all)/n:.0f} chars\n")
+    f.write(f"  Avg code      : {sum(s['code_chars']       for s in scores_all)/n:.0f} chars\n\n")
+    f.write(f"  {'#':>3}  {'Score':>7}  {'Category':<32}  Label\n")
+    f.write(f"  {'─' * 68}\n")
+    for i, (case, score) in enumerate(zip(cases, scores_all)):
+        stars = "★" * score["score"] + "☆" * (score["max_score"] - score["score"])
+        dist  = "" if case["in_distribution"] else " *"
+        f.write(f"  {i+1:>3}  {stars}  {case['category']:<32}  {case['label'][:32]}{dist}\n")
+    f.write(f"\n  * = out-of-distribution (novel target)\n")
 
 
 # ---------------------------------------------------------------------------
@@ -508,18 +571,21 @@ def main():
     if args.case is not None:
         cases = [TEST_CASES[args.case]]
 
-    # Set up output capture if saving
-    output_lines = []
-    original_print = print
-
+    # Prepare output files up front so we can stream results as they generate
+    txt_file  = None
+    jsonl_file = None
     if args.save:
-        Path(args.save).parent.mkdir(parents=True, exist_ok=True)
-        def capturing_print(*a, **kw):
-            line = " ".join(str(x) for x in a)
-            output_lines.append(line)
-            original_print(*a, **kw)
-        import builtins
-        builtins.print = capturing_print
+        save_path = Path(args.save)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path = save_path.with_name(save_path.stem + "_raw.jsonl")
+        txt_file   = open(save_path, "w", encoding="utf-8")
+        jsonl_file = open(raw_path,  "w", encoding="utf-8")
+        # Write header to txt
+        txt_file.write(f"{'═' * W}\n")
+        txt_file.write(f"  Mythos-v4 Inference Eval  |  {len(cases)} test cases  |  "
+                       f"{datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+        txt_file.write(f"  max_new_tokens={args.max_tokens}  temperature={args.temperature}\n")
+        txt_file.write(f"{'═' * W}\n")
 
     # Load model
     model, tokenizer = load_model(args.model, args.base)
@@ -530,6 +596,7 @@ def main():
     )
 
     scores_all = []
+    raw_results = []
 
     for i, case in enumerate(cases):
         dist_tag = "in-dist" if case["in_distribution"] else "OUT-OF-DIST"
@@ -537,16 +604,43 @@ def main():
         print(f"  Category : {case['category']}")
         print(f"  Prompt   :\n{textwrap.indent(case['prompt'], '    ')}")
 
-        output = generate(
+        raw_output = generate(
             model, tokenizer,
             case["prompt"],
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,
         )
 
-        score = score_output(output)
+        score = score_output(raw_output)
         scores_all.append(score)
-        display_output(output, score)
+        raw_results.append({"case": case, "output": raw_output, "score": score})
+
+        # Terminal: truncated display as before
+        display_output(raw_output, score, truncate=True)
+
+        # File: full untruncated, streamed immediately
+        if txt_file:
+            _write_txt_case(txt_file, i, len(cases), case, raw_output, score)
+            txt_file.flush()
+        if jsonl_file:
+            reasoning_m = re.search(r"<reasoning>(.*?)</reasoning>", raw_output, re.DOTALL)
+            code_m      = re.search(r"```python\n(.*?)```", raw_output, re.DOTALL)
+            after_reasoning = ""
+            if reasoning_m:
+                after_reasoning = raw_output[reasoning_m.end():].strip()
+            jsonl_file.write(json.dumps({
+                "index":          i + 1,
+                "label":          case["label"],
+                "category":       case["category"],
+                "in_distribution": case["in_distribution"],
+                "prompt":         case["prompt"],
+                "raw_output":     raw_output,
+                "reasoning":      reasoning_m.group(1).strip() if reasoning_m else None,
+                "after_reasoning": after_reasoning,
+                "code":           code_m.group(1).strip() if code_m else None,
+                "score":          score,
+            }, ensure_ascii=False) + "\n")
+            jsonl_file.flush()
 
     # ── Aggregate summary ────────────────────────────────────────────────────
     print_header("AGGREGATE RESULTS")
@@ -584,6 +678,13 @@ def main():
         print(f"  {i+1:>3}  {stars}  {case['category']:<32}  {case['label'][:32]}{dist}")
     print(f"\n  * = out-of-distribution (novel target)")
 
+    # ── Write aggregate to file ───────────────────────────────────────────────
+    if txt_file:
+        _write_aggregate_txt(txt_file, cases, scores_all)
+        txt_file.close()
+        print(f"\n  Full output  → {args.save}")
+        print(f"  Raw JSONL    → {raw_path}")
+
     # ── Interactive mode ─────────────────────────────────────────────────────
     if args.interactive:
         print_header("INTERACTIVE MODE  (Ctrl+C to exit)")
@@ -607,19 +708,14 @@ def main():
                                   max_new_tokens=args.max_tokens,
                                   temperature=args.temperature)
                 score = score_output(output)
-                display_output(output, score)
+                display_output(output, score, truncate=False)
 
             except KeyboardInterrupt:
                 print("\n\nExiting.")
                 break
 
-    # ── Save output ──────────────────────────────────────────────────────────
-    if args.save:
-        import builtins
-        builtins.print = original_print
-        with open(args.save, "w") as f:
-            f.write("\n".join(output_lines))
-        print(f"\nOutput saved to: {args.save}")
+    if jsonl_file:
+        jsonl_file.close()
 
 
 if __name__ == "__main__":

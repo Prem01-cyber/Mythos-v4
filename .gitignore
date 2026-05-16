@@ -44,3 +44,4 @@ Thumbs.db
 # HuggingFace cache
 .cache/
 sync_mythos.sh
+results
