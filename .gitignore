@@ -1,0 +1,45 @@
+# Secrets
+.env
+
+# ExploitDB — large git repo clone, re-clone on target machine
+exploitdb/
+
+# Raw generated data — re-generate on target machine
+raw/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Model outputs and checkpoints — too large for git
+outputs/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+adapter_config.json
+adapter_model/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# HuggingFace cache
+.cache/
