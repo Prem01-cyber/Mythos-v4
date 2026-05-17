@@ -7,6 +7,9 @@ exploitdb/
 # Raw generated data — re-generate on target machine
 raw/
 
+# Processed training datasets — re-generate via prepare_data.py
+processed/*.jsonl
+
 # Python
 __pycache__/
 *.py[cod]

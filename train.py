@@ -25,6 +25,10 @@ Architecture: Specialized LoRA Adapters (one per source)
     • Adapter 2 (htb)         → multi-turn pentest methodology, HTB chains
     • Adapter 3 (vulhub)      → CVE exploitation, RCE/SSRF/SSTI chains
     • Adapter 4 (attack)      → ATT&CK red team techniques
+    • Adapter 5 (ad)          → Active Directory attack chains
+    • Adapter 6 (webapp)      → Web application exploitation (OWASP Top 10)
+    • Adapter 7 (osint)       → OSINT and external reconnaissance
+    • Adapter 8 (cloud)       → Cloud security (AWS/Azure/GCP)
 
   --source flag selects which dataset this adapter trains on.
   Output path automatically namespaced: outputs/mythos-v4-{source}/
@@ -34,6 +38,10 @@ Usage:
     python3 train.py --source htb                    # Adapter 2 — pentest methodology
     python3 train.py --source vulhub                 # Adapter 3 — CVE exploitation
     python3 train.py --source attack                 # Adapter 4 — ATT&CK techniques
+    python3 train.py --source ad                     # Adapter 5 — Active Directory
+    python3 train.py --source webapp                 # Adapter 6 — Web app exploitation
+    python3 train.py --source osint                  # Adapter 7 — OSINT recon
+    python3 train.py --source cloud                  # Adapter 8 — Cloud security
     python3 train.py --source combined               # all sources merged (ablation only)
     python3 train.py --model q3-8b --source exploitdb   # fast 8B training
     python3 train.py --model q3-32b --qlora --source htb  # 32B on single A100
@@ -59,12 +67,17 @@ parser.add_argument("--model",   default="q3-14b",
                              "q3-32b → Qwen3-32B 65GB, needs 2×A100 or --qlora; "
                              "7b/14b/32b = legacy Qwen2.5-Coder variants")
 parser.add_argument("--source",  default=None,
-                    choices=["exploitdb", "htb", "vulhub", "attack", "combined"],
+                    choices=["exploitdb", "htb", "vulhub", "attack",
+                             "ad", "webapp", "osint", "cloud", "combined"],
                     help="Which dataset to train on. "
-                         "exploitdb → exploit code adapter (3 epochs); "
-                         "htb → pentest methodology adapter (8 epochs); "
-                         "vulhub → CVE exploitation adapter (6 epochs); "
-                         "attack → ATT&CK red team adapter (6 epochs); "
+                         "exploitdb → exploit code adapter (3 epochs, seq=2048); "
+                         "htb → pentest methodology adapter (3 epochs, seq=2560); "
+                         "vulhub → CVE exploitation adapter (8 epochs, seq=2048); "
+                         "attack → ATT&CK red team adapter (5 epochs, seq=1280); "
+                         "ad → Active Directory adapter (12 epochs, seq=1024); "
+                         "webapp → web app exploitation adapter (10 epochs, seq=1792); "
+                         "osint → OSINT recon adapter (12 epochs, seq=1024); "
+                         "cloud → cloud security adapter (14 epochs, seq=1280); "
                          "combined → all sources merged (ablation only)")
 parser.add_argument("--data",    default=None,
                     help="Override dataset path (optional, --source sets this automatically)")
@@ -103,28 +116,41 @@ MODEL_NAME = MODEL_MAP[args.model]
 # Source → (dataset file, output directory, recommended_epochs, max_seq_len)
 # All paths point to processed/ — run `python3 prepare_data.py` locally to generate them.
 #
-# Per-source max_seq_len tuned to actual token distributions (see inspect_tokens.py):
-#   exploitdb  2048  — max 2043, hard-capped single-turn
-#   htb        4096  — max 4062, long multi-turn pentest chains
-#   vulhub     3000  — 98.7% fit; 2 extreme outliers dropped at this limit
-#   attack     2048  — max 1174, compact ATT&CK technique scenarios
+# Per-source max_seq_len set to P99.5 of actual token distribution, rounded to 256.
+# Less padding = faster training, lower VRAM per step, larger effective batch.
+#   exploitdb  2048  — max=2043, perfect fit, 0 truncations
+#   htb        2560  — P97 coverage; tail-turn truncation for long chains; saves 37% vs 4096
+#   vulhub     2048  — P99.5=1913; was 3000, saves 32%
+#   attack     1280  — P99.5=1053; was 2048, saves 37%
+#   ad         1024  — max=940 (!); was 4096, saves 75% compute
+#   webapp     1792  — P99.5=1653; was 3000, saves 40%
+#   osint      1024  — P99.5=848;  was 2048, saves 50%
+#   cloud      1280  — P99.5=1052; was 2048, saves 37%
 #
 # Different max_seq_len per adapter is NOT an issue:
 #   Each adapter trains on a frozen base; seq_len only affects activation memory
 #   during that training run. Adapters are fully interoperable at inference time.
 #
-# Epoch targets — rule of thumb: ~400 total gradient steps
-#   ExploitDB: 2143 ex / 16 eff_batch × 3 epochs = 402 steps ✓
-#   HTB:        188 ex / 16 × 8 epochs  =  94 steps  (small — more passes needed)
-#   Vulhub:     153 ex / 16 × 6 epochs  =  57 steps
-#   ATT&CK:     337 ex / 16 × 6 epochs  = 126 steps
+# Epoch targets — calibrated to ~350-420 gradient steps (eff_batch=16):
+#   exploitdb: 2144 ex / 16 × 3 epochs = 402 steps ✓
+#   htb:       1946 ex / 16 × 3 epochs = 365 steps ✓
+#   vulhub:     644 ex / 16 × 8 epochs = 322 steps ✓
+#   attack:    1230 ex / 16 × 5 epochs = 384 steps ✓
+#   ad:         274 ex / 16 × 12 epochs = 205 steps (small dataset, more passes)
+#   webapp:     326 ex / 16 × 10 epochs = 204 steps
+#   osint:      287 ex / 16 × 12 epochs = 215 steps
+#   cloud:      255 ex / 16 × 14 epochs = 222 steps (smallest)
 SOURCE_MAP = {
-    # source   (data path,                        output dir,                  epochs, seq_len)
-    "exploitdb": ("processed/exploitdb.jsonl",    "outputs/mythos-v4-exploitdb", 3,   2048),
-    "htb":       ("processed/htb_writeups.jsonl", "outputs/mythos-v4-htb",       8,   4096),
-    "vulhub":    ("processed/vulhub.jsonl",        "outputs/mythos-v4-vulhub",    6,   3000),
-    "attack":    ("processed/attack.jsonl",        "outputs/mythos-v4-attack",    6,   2048),
-    "combined":  ("processed/combined.jsonl",      "outputs/mythos-v4-combined",  3,   3000),
+    # source   (data path,                        output dir,                    epochs, seq_len)
+    "exploitdb": ("processed/exploitdb.jsonl",    "outputs/mythos-v4-exploitdb",  3,   2048),
+    "htb":       ("processed/htb_writeups.jsonl", "outputs/mythos-v4-htb",        3,   2560),
+    "vulhub":    ("processed/vulhub.jsonl",        "outputs/mythos-v4-vulhub",     8,   2048),
+    "attack":    ("processed/attack.jsonl",        "outputs/mythos-v4-attack",     5,   1280),
+    "ad":        ("processed/ad.jsonl",            "outputs/mythos-v4-ad",        12,   1024),
+    "webapp":    ("processed/webapp.jsonl",        "outputs/mythos-v4-webapp",    10,   1792),
+    "osint":     ("processed/osint.jsonl",         "outputs/mythos-v4-osint",     12,   1024),
+    "cloud":     ("processed/cloud.jsonl",         "outputs/mythos-v4-cloud",     14,   1280),
+    "combined":  ("processed/combined.jsonl",      "outputs/mythos-v4-combined",   3,   2048),
 }
 
 # Resolve source: explicit --source wins; fall back to detecting from --data; else default
@@ -136,7 +162,7 @@ elif args.data:
     _epoch_default = 3
     _seq_default   = 3000
 else:
-    parser.error("Specify --source (exploitdb | htb | vulhub | attack | combined).")
+    parser.error("Specify --source (exploitdb | htb | vulhub | attack | ad | webapp | osint | cloud | combined).")
 
 DATA_PATH   = args.data   or _data_default
 OUTPUT_DIR  = args.output or _out_default

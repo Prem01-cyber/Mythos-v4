@@ -84,18 +84,18 @@ CATEGORIES = [
     "windows:ad",
 ]
 
-# Expanded targets — 0xdf has 350+ writeups, pulling more phases per machine.
-# MIN_TURNS lowered to 1 so shorter phases are included.
-# linux:insane included now at a small target to capture any rare ones.
+# Targets doubled to reach ~850 total.
+# Hard/insane and windows:ad rely heavily on synthetic generation
+# (fill_hardinsane_gaps + fill_synthetic_gaps) since real 0xdf writeups are capped.
 BENCH_TARGET_PER_CAT: dict[str, int] = {
-    "linux:easy":     90,
-    "linux:medium":   90,
-    "linux:hard":     30,
-    "linux:insane":   10,
-    "windows:easy":   45,
-    "windows:medium": 70,
-    "windows:hard":   20,
-    "windows:ad":     60,
+    "linux:easy":     120,
+    "linux:medium":   150,
+    "linux:hard":      80,
+    "linux:insane":    40,
+    "windows:easy":    70,
+    "windows:medium": 120,
+    "windows:hard":    80,
+    "windows:ad":     190,
 }
 
 # Known difficulty/OS hints in URL slugs or titles  ← improves auto-classification
@@ -1089,6 +1089,176 @@ def fill_hardinsane_gaps(
         print(f"  {cat:<20} {cat_counts.get(cat, 0)}/{targets.get(cat, 0)}")
 
 
+# Synthetic machine pool — expanded to cover all under-target categories
+_SYNTH_MACHINE_POOL: list[tuple[str, str, str, str]] = [
+    # (name, os, difficulty, hint)
+    # ── linux:easy ──
+    ("Topology",      "linux", "easy",   "latex injection, web exploitation"),
+    ("Codify",        "linux", "easy",   "sandbox escape, node.js, password cracking"),
+    ("Analytics",     "linux", "easy",   "metabase CVE, docker breakout"),
+    ("Sau",           "linux", "easy",   "SSRF, command injection"),
+    ("CozyHosting",   "linux", "easy",   "spring boot, command injection"),
+    ("Devvortex",     "linux", "easy",   "joomla CVE, mysql, sudo abuse"),
+    ("BoardLight",    "linux", "easy",   "dolibarr CVE, SUID, phpmailer"),
+    ("GreenHorn",     "linux", "easy",   "pluck CMS, git repo, pixelation bypass"),
+    ("PermX",         "linux", "easy",   "chamilo LMS CVE, symlink sudo abuse"),
+    ("Titanic",       "linux", "easy",   "flask path traversal, gitea, ImageMagick MSL"),
+    ("Dog",           "linux", "easy",   "backdrop CMS, bee CLI sudo"),
+    ("FormulaX",      "linux", "easy",   "XSS, SSRF, chatbot, git commit injection"),
+    # ── linux:medium ──
+    ("WifineticTwo",  "linux", "medium", "OpenPLC RCE, wifi handshake crack, WPS pixie dust"),
+    ("Runner",        "linux", "medium", "teamcity CVE, docker breakout"),
+    ("Editorial",     "linux", "medium", "SSRF, git log, API abuse"),
+    ("Perfection",    "linux", "medium", "SSTI, regex bypass, password hash crack"),
+    ("Hospital",      "linux", "medium", "webshell upload, rundll32, ghostscript CVE"),
+    ("IClean",        "linux", "medium", "XSS, SSTI, qpdf sudo"),
+    ("Headless",      "linux", "medium", "blind XSS, command injection, sudo script"),
+    ("Backfire",      "linux", "medium", "Havoc C2, HardHat C2, iptables DNAT, SSH tunnel"),
+    ("Ghost",         "linux", "medium", "ghost CMS, SSRF internal API, MySQL UDF exploit"),
+    ("Blurry",        "linux", "medium", "ClearML CVE, pickle deserialization, sudo torch"),
+    ("Sightless",     "linux", "medium", "SQLpad SSTI, docker escape, chrome remote debugger"),
+    ("Usage",         "linux", "medium", "laravel file upload, admin panel CVE, wildcard sudo"),
+    # ── linux:hard ──
+    ("Skyfall",       "linux", "hard",   "minio CVE, vault unsealing, nfsshell"),
+    ("Ouija",         "linux", "hard",   "haproxy CRLF, ldap injection, shared library hijack"),
+    ("Napper",        "linux", "hard",   "elasticsearch SSRF, .NET reversing, laps decryption"),
+    ("Gofer",         "linux", "hard",   "SSRF gopher, smtp open relay, sudo notes binary"),
+    ("Cybermonday",   "linux", "hard",   "laravel SSRF, JWT alg confusion, redis docker pivot"),
+    ("Appsanity",     "linux", "hard",   "SSRF internal, PDF LFI, ReflectedXSS, DLL injection"),
+    ("Crafty",        "linux", "hard",   "log4shell, minecraft server, minecraft client plugin"),
+    ("OnlyForYou",    "linux", "hard",   "blind sqli, neo4j injection, gogs, sudo pip3"),
+    ("Socket",        "linux", "hard",   "websocket injection, pyinstaller, sudo quill build"),
+    # ── linux:insane ──
+    ("Skyfall",       "linux", "insane", "minio CVE, vault unsealing, nfsshell, SSRF chain"),
+    ("Ouija",         "linux", "insane", "haproxy CRLF, ldap injection, shared library exploit"),
+    ("Knocking",      "linux", "insane", "port knocking, openvpn MITM, kernel module"),
+    ("Titans",        "linux", "insane", "kerberos linux, ccache ticket, ldap RBCD"),
+    # ── windows:easy ──
+    ("Puppy",         "windows", "easy", "SMB, LDAP enumeration, dpapi secrets, nested groups"),
+    ("Active",        "windows", "easy", "GPP password, kerberoasting"),
+    ("Blue",          "windows", "easy", "EternalBlue MS17-010 exploit"),
+    ("Jerry",         "windows", "easy", "tomcat manager default creds, war upload"),
+    ("Netmon",        "windows", "easy", "PRTG network monitor, CVE command injection"),
+    ("Grandpa",       "windows", "easy", "IIS WebDAV, MS09-050, token impersonation"),
+    # ── windows:medium ──
+    ("SolarLab",      "windows", "medium", "reportlab CVE, openfire CVE, RunasCs"),
+    ("Mailing",       "windows", "medium", "hMailServer, CVE-2024-21413, WinRAR CVE"),
+    ("Jab",           "windows", "medium", "openfire xmpp, ASREPRoast, dcomexec"),
+    ("Pov",           "windows", "medium", "viewstate deserialization, bypass UAC, token abuse"),
+    ("Certified",     "windows", "medium", "ESC9, shadow credentials, AD CS abuse"),
+    ("Blazorized",    "windows", "medium", "MSSQL link, DCSync, AD CS ESC1"),
+    ("Office",        "windows", "medium", "LibreOffice macro, NTLM relay, DPAPI, Kerberoast"),
+    ("Escape",        "windows", "medium", "MSSQL responder, AD CS ESC1"),
+    ("Napper",        "windows", "medium", "elasticsearch SSRF, dotnet reversing, LAPS"),
+    # ── windows:hard ──
+    ("Vintage",       "windows", "hard", "delegation abuse, AS-REP pre-auth disabled, gMSA"),
+    ("Fluffy",        "windows", "hard", "shadow credentials, mAQ abuse, GenericWrite ACL"),
+    ("Fuse",          "windows", "hard", "enumeration LDAP, password spray, SeLoadDriverPrivilege"),
+    ("StreamIO",      "windows", "hard", "SQLI, LFI, CLSID, bloodhound, LAPS"),
+    ("Object",        "windows", "hard", "jenkins, firewall bypass, ACL abuse, DC sync"),
+    # ── windows:ad ──
+    ("Rebound",       "windows", "ad", "RID cycling, targeted kerberoast, shadow creds, cross-session relay"),
+    ("Absolute",      "windows", "ad", "Kerberos pre-auth bypass, PKINIT, delegations, KrbRelay"),
+    ("Manager",       "windows", "ad", "mssql xp_dirtree, AD CS ESC7"),
+    ("Forest",        "windows", "ad", "AS-REPRoasting, DCSync, Exchange privilege escalation"),
+    ("Sauna",         "windows", "ad", "LDAP anonymous bind, AS-REPRoast, DCSync, autologon"),
+    ("Return",        "windows", "ad", "printer admin, WinRM, Server Operators group abuse"),
+    ("Support",       "windows", "ad", "LDAP, encrypted password in binary, RBCD abuse"),
+    ("Blackfield",    "windows", "ad", "AS-REPRoast, bloodhound, SeBackupPrivilege, DCSync"),
+    ("Monteverde",    "windows", "ad", "LDAP enum, Azure AD Connect password extraction"),
+    ("Cascade",       "windows", "ad", "LDAP, deleted objects, AD Recycle Bin, COM decryption"),
+    ("Intelligence",  "windows", "ad", "PDF metadata, password spray, GMSA, constrained delegation"),
+    ("Flight",        "windows", "ad", "SMB relay, Kerberos, write NTFS alternate data stream"),
+    ("Coerced",       "windows", "ad", "PrinterBug, WebClient coercion, NTLM relay, RBCD"),
+    ("Sekhmet",       "windows", "ad", "Kerberoast, unconstrained delegation, forest trust abuse"),
+    ("Hathor",        "windows", "ad", "AppLocker bypass, LAPS, shadow credentials, cross-forest trust"),
+    ("Outdated",      "windows", "ad", "follina CVE, WSUS abuse, shadow credentials"),
+    ("Authority",     "windows", "ad", "ansible vault, AD CS ESC1, PKINIT NTLM"),
+    ("Cerberus",      "windows", "ad", "fiberhome CVE, winrm, IIS, AD CS ADCS ESC9"),
+    ("Tengu",         "windows", "ad", "MSSQL links, kerberos delegation, AD forest trust"),
+    ("Ghost",         "windows", "ad", "LDAP ghost, kerberos ticket abuse, RBCD delegation"),
+]
+
+_SYNTH_PHASES = ["Enumeration", "Foothold", "Lateral Movement", "Privilege Escalation", "Post-Exploitation"]
+
+
+def fill_synthetic_gaps(
+    output_path: str,
+    targets: dict[str, int],
+    workers: int = DEFAULT_WORKERS,
+) -> None:
+    """
+    After scraping + hard/insane fill, top up ALL categories still below target
+    using GPT-synthesized examples drawn from _SYNTH_MACHINE_POOL.
+    Cycles through the pool (with phase variation) until every category is satisfied.
+    """
+    cat_counts = load_existing_counts(output_path)
+    gap_cats   = {c for c in targets if cat_counts.get(c, 0) < targets.get(c, 0)}
+    if not gap_cats:
+        print("\nAll categories already at target — no synthetic fill needed.")
+        return
+
+    total_gap = sum(max(0, targets[c] - cat_counts.get(c, 0)) for c in gap_cats)
+    print(f"\n[Synthetic fill] {len(gap_cats)} categories below target, generating {total_gap} examples")
+
+    pool: list[tuple[str, str, str, str, str]] = []
+    for name, os_l, diff, hint in _SYNTH_MACHINE_POOL:
+        ad_cat = "windows:ad" if (os_l == "windows" and any(
+            kw in hint.lower() for kw in ("ad", "kerberos", "domain", "ldap", "dcsync", "esc", "bloodhound")
+        )) else None
+        cat = ad_cat or f"{os_l}:{diff}"
+        if cat in gap_cats:
+            for phase in _SYNTH_PHASES:
+                pool.append((name, os_l, diff, hint, phase))
+    random.shuffle(pool)
+
+    counts_lock = threading.Lock()
+    pbar = tqdm(total=total_gap, desc="Synthetic fill (all cats)", unit="ex")
+
+    def _gen(item: tuple) -> int:
+        name, os_l, diff, hint, phase = item
+        ad = any(kw in hint.lower() for kw in ("ad", "kerberos", "domain", "ldap", "dcsync", "esc", "bloodhound"))
+        cat = ("windows:ad" if (os_l == "windows" and ad) else f"{os_l}:{diff}")
+        with counts_lock:
+            if cat_counts.get(cat, 0) >= targets.get(cat, 0):
+                return 0
+        ex = generate_synthetic_htb_example(name, os_l, diff, hint, phase)
+        if ex is None:
+            return 0
+        with counts_lock:
+            if cat_counts.get(cat, 0) >= targets.get(cat, 0):
+                return 0
+            with open(output_path, "a") as f:
+                f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        return 1
+
+    passes = 0
+    while True:
+        still_short = {c for c in targets if cat_counts.get(c, 0) < targets.get(c, 0)}
+        if not still_short:
+            break
+        if passes > 15:
+            print(f"  [warn] Hit pass limit, remaining gaps: {still_short}")
+            break
+        passes += 1
+        random.shuffle(pool)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futs = [executor.submit(_gen, item) for item in pool]
+            for fut in as_completed(futs):
+                n = fut.result()
+                if n:
+                    pbar.update(n)
+
+    pbar.close()
+    print("\nFinal counts after synthetic fill:")
+    for cat in sorted(targets):
+        done = cat_counts.get(cat, 0)
+        tgt  = targets[cat]
+        pct  = int(100 * done / tgt) if tgt else 0
+        print(f"  {cat:<20} {done:>4}/{tgt:<4}  {pct}%")
+
+
 # ---------------------------------------------------------------------------
 # Test mode  (5 machines, no saves, shows extracted data)
 # ---------------------------------------------------------------------------
@@ -1166,6 +1336,8 @@ def main() -> None:
                         help="Start fresh, ignore existing output")
     parser.add_argument("--force-fetch",     action="store_true",
                         help="Ignore HTML cache, re-scrape all pages")
+    parser.add_argument("--synthetic-only",  action="store_true",
+                        help="Skip 0xdf scraping; only run synthetic gap-fill passes")
     args = parser.parse_args()
 
     if args.test:
@@ -1180,26 +1352,37 @@ def main() -> None:
 
     targets = compute_category_targets()
 
-    print(f"\nDiscovering HTB writeup URLs from {BASE_URL}...")
-    urls = get_htb_writeup_urls()
-    print(f"Found {len(urls)} writeup URLs")
+    if not args.synthetic_only:
+        print(f"\nDiscovering HTB writeup URLs from {BASE_URL}...")
+        urls = get_htb_writeup_urls()
+        print(f"Found {len(urls)} writeup URLs")
 
-    if not urls:
-        print("ERROR: No URLs found. Check network access.")
-        return
+        if not urls:
+            print("ERROR: No URLs found. Check network access.")
+            return
 
-    print_benchmark_table(targets, load_existing_counts(args.output))
+        print_benchmark_table(targets, load_existing_counts(args.output))
 
-    build_htb_dataset(
-        urls        = urls,
-        targets     = targets,
-        output_path = args.output,
-        workers     = args.workers,
-        resume      = not args.no_resume,
-    )
+        build_htb_dataset(
+            urls        = urls,
+            targets     = targets,
+            output_path = args.output,
+            workers     = args.workers,
+            resume      = not args.no_resume,
+        )
 
-    # Fill any remaining hard/insane gaps that 0xdf couldn't cover
-    fill_hardinsane_gaps(
+        # Fill remaining hard/insane gaps from curated machine list
+        fill_hardinsane_gaps(
+            output_path = args.output,
+            targets     = targets,
+            workers     = args.workers,
+        )
+    else:
+        print("\n[--synthetic-only] Skipping 0xdf scrape, running gap-fill passes only")
+        print_benchmark_table(targets, load_existing_counts(args.output))
+
+    # Fill ALL remaining category gaps with generic synthetic examples
+    fill_synthetic_gaps(
         output_path = args.output,
         targets     = targets,
         workers     = args.workers,

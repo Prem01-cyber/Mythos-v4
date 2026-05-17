@@ -7,18 +7,30 @@ Reads (in order):
   raw/htb_writeups.jsonl      Source 2 — HTB multi-turn pentest methodology
   raw/vulhub.jsonl            Source 3 — CVE exploitation chains (Vulhub)
   raw/attack.jsonl            Source 4 — MITRE ATT&CK red team technique chains
+  raw/ad.jsonl                Source 5 — Active Directory attack chains
+  raw/webapp.jsonl            Source 6 — Web application exploitation
+  raw/osint.jsonl             Source 7 — OSINT and external recon
+  raw/cloud.jsonl             Source 8 — Cloud security (AWS/Azure/GCP)
 
 Writes:
-  processed/htb_writeups.jsonl   Processed HTB examples  (pushed to git)
+  processed/htb_writeups.jsonl   Processed HTB examples
   processed/vulhub.jsonl         Processed Vulhub examples
   processed/attack.jsonl         Processed ATT&CK examples
+  processed/ad.jsonl             Processed AD examples
+  processed/webapp.jsonl         Processed webapp examples
+  processed/osint.jsonl          Processed OSINT examples
+  processed/cloud.jsonl          Processed cloud examples
   processed/combined.jsonl       All sources merged + shuffled
 
-Per-source max_tokens (matched to actual token distributions):
-  exploitdb  → 2048  (max 2043 — already fits perfectly)
-  htb        → 4096  (max 4062 — long multi-turn pentest chains)
-  vulhub     → 3000  (98.7% fit; 2 extreme outliers dropped)
-  attack     → 2048  (max 1174 — compact technique scenarios)
+Per-source max_tokens (tight-fit to P99.5, rounded to nearest 256):
+  exploitdb  → 2048  (max 2043 — perfect fit, no waste)
+  htb        → 2560  (P97 coverage; tail turns truncated for long chains, saves 37% vs 4096)
+  vulhub     → 2048  (P99.5=1913 — was 3000, saves 32%)
+  attack     → 1280  (P99.5=1053 — was 2048, saves 37%)
+  ad         → 1024  (max=940 — was 4096, saves 75%!)
+  webapp     → 1792  (P99.5=1653 — was 3000, saves 40%)
+  osint      → 1024  (P99.5=848  — was 2048, saves 50%)
+  cloud      → 1280  (P99.5=1052 — was 2048, saves 37%)
 
 Multi-turn truncation strategy (Sources 2–4):
   1. Total ≤ MAX_TOKENS → keep as-is
@@ -50,10 +62,14 @@ ENCODING      = "gpt-4o"
 # (raw_input, source_label, max_tokens, processed_output)
 # max_tokens tuned to each source's actual distribution (see inspect_tokens.py)
 SOURCES = [
-    ("processed/exploitdb.jsonl", "exploitdb",    2048, "processed/exploitdb.jsonl"),
-    ("raw/htb_writeups.jsonl",    "htb_writeup",  4096, "processed/htb_writeups.jsonl"),
-    ("raw/vulhub.jsonl",          "vulhub",        3000, "processed/vulhub.jsonl"),
-    ("raw/attack.jsonl",          "mitre_attack",  2048, "processed/attack.jsonl"),
+    ("processed/exploitdb.jsonl", "exploitdb",   2048, "processed/exploitdb.jsonl"),
+    ("raw/htb_writeups.jsonl",    "htb_writeup", 2560, "processed/htb_writeups.jsonl"),
+    ("raw/vulhub.jsonl",          "vulhub",      2048, "processed/vulhub.jsonl"),
+    ("raw/attack.jsonl",          "mitre_attack",1280, "processed/attack.jsonl"),
+    ("raw/ad.jsonl",              "ad",          1024, "processed/ad.jsonl"),
+    ("raw/webapp.jsonl",          "webapp",      1792, "processed/webapp.jsonl"),
+    ("raw/osint.jsonl",           "osint",       1024, "processed/osint.jsonl"),
+    ("raw/cloud.jsonl",           "cloud",       1280, "processed/cloud.jsonl"),
 ]
 
 SOURCE_FILTER = {
@@ -61,6 +77,10 @@ SOURCE_FILTER = {
     "htb":       1,
     "vulhub":    2,
     "attack":    3,
+    "ad":        4,
+    "webapp":    5,
+    "osint":     6,
+    "cloud":     7,
 }
 
 OUTPUT_PATH = "processed/combined.jsonl"

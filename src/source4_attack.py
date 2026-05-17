@@ -102,19 +102,19 @@ STIX_TACTIC_NORM: dict[str, str] = {
 # "resource-development" omitted: Atomic Red Team has zero tests for T1583-T1588 etc.
 # (pre-compromise infra techniques that can't be expressed as runnable CLI commands).
 BENCH_TARGET_PER_CAT: dict[str, int] = {
-    "execution":              80,   # 29 IDs × ~3 tests = ~87 max; current=82
-    "discovery":              80,   # 34 IDs × ~3 tests = ~102 max; current=82
-    "credential-access":      70,   # 37 IDs × ~2 tests = ~74 max; current=70
-    "persistence":            70,   # 43 IDs × ~2 tests = ~86 max; current=70
-    "privilege-escalation":   70,   # 19 IDs × ~4 tests = ~76 max; current=70
-    "defense-evasion":        90,   # 105 IDs available — was 0 due to STIX name bug, now fixed
-    "command-and-control":    50,   # 14 IDs × ~4 tests = ~56 max; current=50
-    "collection":             40,   # 19 IDs × ~3 tests = ~57 max; current=43
-    "impact":                 40,   # 8 IDs × ~5 tests = ~40 max; current=40
-    "lateral-movement":       30,   # 11 IDs × ~3 tests = ~33 max; current=24
-    "exfiltration":           25,   # 8 IDs × ~3 tests = ~24 max; current=23
-    "initial-access":         15,   # 5 IDs × ~3 tests = ~15 max; current=7
-    "reconnaissance":         10,   # 2 IDs × ~4 tests = ~8 max; current=2
+    "execution":              95,   # increased for synthetic fill
+    "discovery":              95,
+    "credential-access":      85,
+    "persistence":            85,
+    "privilege-escalation":   85,
+    "defense-evasion":       105,
+    "command-and-control":    65,
+    "collection":             55,
+    "impact":                 55,
+    "lateral-movement":       55,   # sparse in Atomic Red Team → synthetic fill
+    "exfiltration":           45,
+    "initial-access":         40,   # sparse → synthetic fill
+    "reconnaissance":         30,   # very sparse → synthetic fill
 }
 
 THOUGHT_PROMPT = """\
@@ -583,6 +583,272 @@ def show_progress(cat_counts: dict, targets: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Synthetic gap-fill for sparse categories
+# ---------------------------------------------------------------------------
+
+# Concrete technique seeds for categories that are sparse in Atomic Red Team
+_SYNTH_TECHNIQUE_SEEDS: dict[str, list[tuple[str, str, str, str]]] = {
+    "initial-access": [
+        ("T1566.001", "Spearphishing Attachment",          "windows", "Send macro-laden Office doc via email; victim opens attachment triggering mshta.exe"),
+        ("T1190",     "Exploit Public-Facing Application", "linux",   "Exploit Apache Log4j RCE (CVE-2021-44228) via crafted JNDI LDAP payload in User-Agent header"),
+        ("T1133",     "External Remote Services",          "windows", "Gain initial access via exposed RDP with weak credentials; use Crowbar bruteforce"),
+        ("T1078",     "Valid Accounts",                    "linux",   "Authenticate via SSH with leaked credentials found in GitHub repository"),
+        ("T1195.002", "Compromise Software Supply Chain",  "linux",   "Inject malicious npm package version that executes reverse shell on install"),
+        ("T1566.002", "Spearphishing Link",                "windows", "Send link to malicious HTA file hosted on attacker infra; HTA executes PowerShell stager"),
+        ("T1091",     "Replication Through Removable Media", "windows", "USB drop with AutoRun.inf and malicious LNK file that spawns reverse shell"),
+        ("T1190",     "Exploit Public-Facing Application", "linux",   "Exploit Apache Struts CVE-2017-5638 RCE via crafted Content-Type header"),
+        ("T1190",     "Exploit Public-Facing Application", "linux",   "Exploit Atlassian Confluence CVE-2022-26134 OGNL injection for unauthenticated RCE"),
+        ("T1078.003", "Valid Accounts: Local Accounts",    "linux",   "Spray discovered /etc/passwd users against SSH using hydra with common passwords"),
+        ("T1566.001", "Spearphishing Attachment",          "windows", "Send ISO file with LNK inside to bypass Mark-of-the-Web; LNK calls rundll32 loader"),
+        ("T1190",     "Exploit Public-Facing Application", "windows", "Exploit Exchange ProxyLogon CVE-2021-26855 + CVE-2021-27065 to write webshell"),
+        ("T1078.001", "Valid Accounts: Default Accounts",  "linux",   "Access Tomcat manager with default admin:admin credentials and deploy WAR webshell"),
+        ("T1133",     "External Remote Services",          "linux",   "Exploit exposed Citrix ADC (CVE-2019-19781) path traversal to gain initial foothold"),
+        ("T1190",     "Exploit Public-Facing Application", "linux",   "Exploit GitLab CE RCE CVE-2021-22205 via unsafe ExifTool image processing"),
+        ("T1566.003", "Spearphishing via Service",         "windows", "Deliver payload via Teams message with malicious link exploiting CVE-2023-36745"),
+    ],
+    "reconnaissance": [
+        ("T1595.001", "Active Scanning: Scanning IP Blocks",           "linux", "Masscan the target /24 then nmap service scan on discovered open ports"),
+        ("T1592.002", "Gather Victim Host Information: Software",      "linux", "Fingerprint target web stack via HTTP headers and Wappalyzer-style probing"),
+        ("T1589.001", "Gather Victim Identity Information: Credentials","linux", "Search GitHub/Pastebin for leaked org credentials using custom dork queries"),
+        ("T1596.005", "Search Open Technical Databases: Scan Databases","linux", "Query Shodan and Censys for exposed services and CVE fingerprints on target IP range"),
+        ("T1593.001", "Search Open Websites/Domains: Social Media",    "linux", "Harvest employee names/roles via LinkedIn scraping using linkedin2username"),
+        ("T1598.003", "Phishing for Information: Spearphishing Link",  "windows","Craft credential harvesting page mimicking VPN portal; gather credentials"),
+        ("T1590.001", "Gather Victim Network Information: Domain Properties","linux","Passive DNS enumeration using dnsx, subfinder, and amass for subdomain discovery"),
+        ("T1595.002", "Active Scanning: Vulnerability Scanning",       "linux", "Run nuclei against discovered web endpoints to fingerprint CVEs and misconfigs"),
+        ("T1592.001", "Gather Victim Host Information: Hardware",       "linux", "SNMP walk against target network devices to enumerate hardware and software inventory"),
+        ("T1591.002", "Gather Victim Org Information: Business Relationships","linux","Map third-party vendors and supply chain partners via WHOIS/ASN lookups and job postings"),
+        ("T1596.001", "Search Open Technical Databases: DNS/Passive DNS","linux","Use SecurityTrails and DNSDB to enumerate historical DNS records and subdomains"),
+        ("T1594",     "Search Victim-Owned Websites",                  "linux", "Spider target website with gospider collecting URLs, forms, and JavaScript endpoints"),
+        ("T1589.002", "Gather Victim Identity Information: Email Addresses","linux","Run theHarvester against target domain to collect email addresses from public sources"),
+        ("T1590.002", "Gather Victim Network Information: DNS",         "linux", "Zone transfer attempt with dig AXFR, fallback to dnsx brute-force subdomain enumeration"),
+        ("T1593.002", "Search Open Websites/Domains: Search Engines",  "linux", "Google dork for exposed admin panels, config files, and credentials for target domain"),
+        ("T1597.001", "Search Closed Sources: Threat Intel Vendors",   "linux", "Query VirusTotal and AlienVault OTX for known malware hashes and C2s linked to target"),
+    ],
+    "lateral-movement": [
+        ("T1021.001", "Remote Services: Remote Desktop Protocol",       "windows", "Use harvested credentials to RDP into lateral target; enable clipboard for data transfer"),
+        ("T1021.002", "Remote Services: SMB/Windows Admin Shares",      "windows", "Use impacket psexec with NTLM hash to spawn shell on lateral target via C$ share"),
+        ("T1550.002", "Use Alternate Authentication Material: Pass the Hash","windows","Use mimikatz NTLM hash with wmiexec for lateral movement without plaintext password"),
+        ("T1021.006", "Remote Services: Windows Remote Management",     "windows", "Invoke-Command over WinRM with harvested credentials for lateral code execution"),
+        ("T1534",     "Internal Spearphishing",                         "windows", "Send phishing email from compromised internal mailbox to high-value target"),
+        ("T1570",     "Lateral Tool Transfer",                          "linux",   "Use SCP from foothold to upload tools to lateral pivot over SSH tunnel"),
+        ("T1563.002", "Remote Service Session Hijacking: RDP Hijacking","windows", "Hijack disconnected RDP session using tscon without password via SYSTEM token"),
+        ("T1550.003", "Use Alternate Authentication Material: Pass the Ticket","windows","Import harvested Kerberos TGT with mimikatz ptt for lateral movement to DC"),
+        ("T1021.004", "Remote Services: SSH",                           "linux",   "SSH from compromised host using private key found in /home/user/.ssh to lateral target"),
+        ("T1021.003", "Remote Services: Distributed Component Object Model","windows","Use DCOM MMC20.Application method to execute code on remote host via impacket dcomexec"),
+        ("T1080",     "Taint Shared Content",                           "windows", "Drop malicious macro-enabled template into network share accessed by target users"),
+        ("T1021.005", "Remote Services: VNC",                           "linux",   "Connect to internal VNC server with extracted password from config file"),
+        ("T1550.001", "Use Alternate Authentication Material: Application Access Token","linux","Reuse harvested JWT to authenticate to internal API service as admin user"),
+        ("T1210",     "Exploitation of Remote Services",                "windows", "Use EternalBlue (MS17-010) against unpatched lateral host within internal network"),
+        ("T1563.001", "Remote Service Session Hijacking: SSH Hijacking","linux",   "Hijack SSH agent socket via ControlMaster to connect to target without credentials"),
+        ("T1072",     "Software Deployment Tools",                      "windows", "Abuse SCCM distribution point to deploy malicious package to target endpoint"),
+    ],
+    "exfiltration": [
+        ("T1041",     "Exfiltration Over C2 Channel",                   "linux",   "Chunk and base64-encode sensitive files then exfil via existing C2 beacon traffic"),
+        ("T1048.003", "Exfiltration Over Alternative Protocol: DNS",    "linux",   "Exfil data via DNS TXT record queries using dnscat2 tunnel to bypass firewall"),
+        ("T1052.001", "Exfiltration Over Physical Medium: USB",         "windows", "Copy staged loot to mounted USB device via robocopy with volume shadow bypass"),
+        ("T1567.002", "Exfiltration Over Web Service: Cloud Storage",   "linux",   "Upload encrypted loot to attacker-controlled S3 bucket using aws cli with stolen keys"),
+        ("T1020",     "Automated Exfiltration",                         "linux",   "Scheduled cron job archives /home/**/.ssh and POSTs archive to attacker webhook nightly"),
+        ("T1030",     "Data Transfer Size Limits",                      "linux",   "Split archive into 50MB chunks and exfil sequentially to avoid DLP size thresholds"),
+        ("T1048.001", "Exfiltration Over Alternative Protocol: ICMP",   "linux",   "Encode loot in ICMP ping payload using icmpsh to bypass outbound TCP/UDP restrictions"),
+        ("T1567.001", "Exfiltration Over Web Service: Exfil to Code Repo","linux", "Push sensitive files to attacker-controlled private GitHub repo using git push"),
+        ("T1011.001", "Exfiltration Over Other Network Medium: Bluetooth","windows","Pair attacker phone via Bluetooth and transfer staged archive over OBEX FTP"),
+        ("T1048.002", "Exfiltration Over Alternative Protocol: HTTPS",  "linux",   "POST base64-encoded data to attacker HTTPS server mimicking legitimate analytics beacon"),
+        ("T1029",     "Scheduled Transfer",                             "linux",   "Set nightly cron to archive new files in /var/log and POST to webhook at 03:00"),
+        ("T1537",     "Transfer Data to Cloud Account",                 "linux",   "Use rclone with attacker-controlled cloud provider credentials to sync loot directory"),
+    ],
+}
+
+SYNTH_ATTACK_PROMPT = """\
+You are simulating a MITRE ATT&CK red team exercise.
+
+Technique: {technique_id} — {technique_name}
+Tactic: {tactic}
+Platform: {platform}
+Scenario context: {hint}
+
+Generate a realistic {n_turns}-turn attacker dialogue executing this technique.
+
+For EACH turn output exactly:
+THOUGHT: <2-3 sentence first-person reasoning about what you're doing and why>
+COMMAND: <exact shell/CLI command — no placeholders, use realistic IPs/domains>
+OUTPUT: <realistic terminal output, 3-8 lines>
+---
+
+Start directly with TURN 1.
+"""
+
+
+def _load_cat_counts_attack(output_path: str, targets: dict) -> dict[str, int]:
+    counts: dict[str, int] = {c: 0 for c in targets}
+    if Path(output_path).exists():
+        with open(output_path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    ex = json.loads(line)
+                    cat = ex["metadata"].get("tactic", "")
+                    if cat in counts:
+                        counts[cat] += 1
+                except Exception:
+                    pass
+    return counts
+
+
+def _parse_synth_attack_turns(raw: str) -> list[dict]:
+    turns = []
+    blocks = re.split(r"---+", raw)
+    for block in blocks:
+        thought = re.search(r"THOUGHT:\s*(.+?)(?=COMMAND:|$)", block, re.S)
+        command = re.search(r"COMMAND:\s*(.+?)(?=OUTPUT:|$)", block, re.S)
+        output  = re.search(r"OUTPUT:\s*(.+?)$", block, re.S)
+        t = thought.group(1).strip() if thought else ""
+        c = command.group(1).strip() if command else ""
+        o = output.group(1).strip()  if output  else ""
+        if t and c:
+            turns.append({"thought": t, "command": c, "output": o})
+    return turns
+
+
+def _gpt_attack(prompt: str, max_tokens: int = 1000) -> str:
+    client = OpenAI()
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=0.85,
+    )
+    return resp.choices[0].message.content or ""
+
+
+def generate_synthetic_attack_example(
+    technique_id: str, technique_name: str, tactic: str,
+    platform: str, hint: str,
+) -> dict | None:
+    n_turns = random.randint(2, 4)
+    try:
+        raw = _gpt_attack(SYNTH_ATTACK_PROMPT.format(
+            technique_id=technique_id, technique_name=technique_name,
+            tactic=tactic, platform=platform, hint=hint, n_turns=n_turns,
+        ), max_tokens=1100)
+    except Exception:
+        return None
+
+    turns = _parse_synth_attack_turns(raw)
+    if len(turns) < 2:
+        return None
+
+    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.append({
+        "role": "user",
+        "content": (
+            f"ATT&CK Technique: {technique_id} — {technique_name}\n"
+            f"Tactic: {tactic}\nPlatform: {platform}\n\n{hint}\n\n"
+            "What is your first action?"
+        ),
+    })
+
+    for i, turn in enumerate(turns[:MAX_TURNS]):
+        asst = (
+            f"<thought>\n{turn['thought']}\n</thought>\n\n"
+            f"<command>\n{turn['command']}\n</command>"
+        )
+        messages.append({"role": "assistant", "content": asst})
+        if i < len(turns) - 1:
+            nxt_out = turns[i + 1]["output"] or "(no output)"
+            messages.append({
+                "role": "user",
+                "content": f"Output:\n```\n{nxt_out}\n```\n\nWhat is the next step?",
+            })
+
+    return {
+        "messages": messages,
+        "metadata": {
+            "source":       "attack_synthetic",
+            "technique_id": technique_id,
+            "test_name":    f"synthetic_{technique_id}",
+            "tactic":       tactic,
+            "platform":     platform,
+            "synthetic":    True,
+        },
+    }
+
+
+def fill_synthetic_attack_gaps(
+    output_path: str,
+    targets: dict[str, int],
+    workers: int = DEFAULT_WORKERS,
+) -> None:
+    """Top up sparse ATT&CK categories using seeded synthetic technique chains."""
+    cat_counts = _load_cat_counts_attack(output_path, targets)
+    gap_cats   = {c for c in targets if cat_counts.get(c, 0) < targets.get(c, 0)}
+    if not gap_cats:
+        print("\nAll ATT&CK categories at target — no synthetic fill needed.")
+        return
+
+    total_gap = sum(max(0, targets[c] - cat_counts.get(c, 0)) for c in gap_cats)
+    print(f"\n[ATT&CK synthetic fill] {len(gap_cats)} categories below target, generating {total_gap} examples")
+    print(f"  Under-target: {sorted(gap_cats)}")
+
+    # Build work queue from seeds; cycle until categories are filled
+    seeds: list[tuple[str, str, str, str, str]] = []
+    for cat in gap_cats:
+        for tid, tname, platform, hint in _SYNTH_TECHNIQUE_SEEDS.get(cat, []):
+            seeds.append((tid, tname, cat, platform, hint))
+    # For cats without specific seeds, generate generic ones
+    for cat in gap_cats:
+        if cat not in _SYNTH_TECHNIQUE_SEEDS:
+            seeds.extend([
+                (f"SYNTH-{cat}", cat.replace("-", " ").title(), cat, "linux", f"Generic {cat} technique scenario"),
+                (f"SYNTH-{cat}", cat.replace("-", " ").title(), cat, "windows", f"Windows-specific {cat} technique scenario"),
+            ])
+
+    if not seeds:
+        print("  No seeds available for synthetic generation.")
+        return
+
+    counts_lock = threading.Lock()
+    pbar = tqdm(total=total_gap, desc="ATT&CK synthetic", unit="ex")
+
+    def _gen(seed: tuple) -> int:
+        tid, tname, cat, platform, hint = seed
+        with counts_lock:
+            if cat_counts.get(cat, 0) >= targets.get(cat, 0):
+                return 0
+        ex = generate_synthetic_attack_example(tid, tname, cat, platform, hint)
+        if ex is None:
+            return 0
+        with counts_lock:
+            if cat_counts.get(cat, 0) >= targets.get(cat, 0):
+                return 0
+            with open(output_path, "a") as f:
+                f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        return 1
+
+    passes = 0
+    while True:
+        still_short = {c for c in targets if cat_counts.get(c, 0) < targets.get(c, 0)}
+        if not still_short:
+            break
+        if passes > 20:
+            print(f"  [warn] Pass limit reached. Remaining: {still_short}")
+            break
+        passes += 1
+        random.shuffle(seeds)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futs = [executor.submit(_gen, seed) for seed in seeds]
+            for fut in as_completed(futs):
+                n = fut.result()
+                if n:
+                    pbar.update(n)
+
+    pbar.close()
+    print("\nFinal ATT&CK distribution after synthetic fill:")
+    show_progress(cat_counts, targets)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -591,10 +857,22 @@ def main() -> None:
                         help="Process 5 techniques, no file output")
     parser.add_argument("--list-categories", action="store_true")
     parser.add_argument("--workers",         type=int, default=DEFAULT_WORKERS)
+    parser.add_argument("--synthetic-only",  action="store_true",
+                        help="Skip Atomic Red Team fetch; only run synthetic gap-fill")
     args = parser.parse_args()
 
     Path("raw").mkdir(exist_ok=True)
     Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
+
+    if args.synthetic_only:
+        print("[--synthetic-only] Skipping Atomic Red Team fetch, running synthetic gap-fill only")
+        targets = dict(BENCH_TARGET_PER_CAT)
+        fill_synthetic_attack_gaps(
+            output_path = OUTPUT_PATH,
+            targets     = targets,
+            workers     = args.workers,
+        )
+        return
 
     # Load tactic + name mapping from STIX
     print("Loading ATT&CK tactic mapping from STIX…")
@@ -688,6 +966,14 @@ def main() -> None:
 
     if args.test:
         print("[--test mode] No file written.")
+        return
+
+    # Top up sparse categories with synthetic examples
+    fill_synthetic_attack_gaps(
+        output_path = OUTPUT_PATH,
+        targets     = targets,
+        workers     = args.workers,
+    )
 
 
 if __name__ == "__main__":

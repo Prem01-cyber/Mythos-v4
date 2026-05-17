@@ -90,6 +90,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-new-tokens", type=int, default=2048)
     p.add_argument("--temperature",    type=float, default=0.3)
 
+    # ── RAG live intelligence ─────────────────────────────────────────────────
+    p.add_argument("--rag", action="store_true",
+                   help="Enable RAG: inject live NVD CVE + Exploit-DB context into prompts")
+    p.add_argument("--rag-max-age", type=int, default=24, metavar="HOURS",
+                   help="Refresh RAG cache after this many hours (default: 24)")
+
+    # ── Feedback loop ─────────────────────────────────────────────────────────
+    p.add_argument("--no-feedback", action="store_true",
+                   help="Disable engagement feedback loop (do not queue turns for retraining)")
+    p.add_argument("--feedback-threshold", type=int, default=50, metavar="N",
+                   help="Retrain threshold: trigger retraining when N new examples queued (default: 50)")
+
     # ── Misc ──────────────────────────────────────────────────────────────────
     p.add_argument("--debug",     action="store_true", help="Enable verbose debug logging")
     p.add_argument("--no-splash", action="store_true", help="Skip splash screen")
@@ -140,6 +152,12 @@ def _build_config(args: argparse.Namespace) -> "PentestGPTConfig":
         # Bug bounty
         bug_bounty=getattr(args, "bug_bounty", False),
         scope_file=getattr(args, "scope", None),
+        # RAG
+        rag_enabled=getattr(args, "rag", False),
+        rag_max_age_hours=getattr(args, "rag_max_age", 24),
+        # Feedback loop
+        feedback_enabled=not getattr(args, "no_feedback", False),
+        feedback_threshold=getattr(args, "feedback_threshold", 50),
     )
 
     return PentestGPTConfig(

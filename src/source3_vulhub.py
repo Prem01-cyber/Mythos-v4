@@ -2,11 +2,11 @@
 """
 Source 3: Vulhub CVE Exploitation Scenarios
 
-Pulls 332 real CVE exploitation README files from github.com/vulhub/vulhub,
+Pulls ~330 real CVE exploitation README files from github.com/vulhub/vulhub,
 parses command-output chains, generates attacker thoughts via GPT-4o-mini,
 and formats as multi-turn training examples.
 
-Each example = one CVE exploitation scenario (3–6 turns):
+Each example = one CVE exploitation scenario (2–6 turns):
   system : autonomous exploit developer / penetration tester
   user   : "CVE: ... — Target: ... env is up. What is your first step?"
   asst   : "<thought>...</thought>\n\n<command>\n...\n</command>"
@@ -14,12 +14,20 @@ Each example = one CVE exploitation scenario (3–6 turns):
   asst   : "<thought>...</thought>\n\n<command>\n...\n</command>"
   ...
 
+Two generation modes:
+  1. README-based  — real commands parsed from vulhub repo (primary)
+  2. Synthetic     — GPT generates full multi-phase chains for categories
+                     that still have capacity after README pass (gap-filling)
+
+Target: ~800 examples across 14 categories.
+
 Categories map to OWASP/vuln class taxonomy so the benchmark stays comparable.
 
 Usage:
   python3 src/source3_vulhub.py --test            # 5 CVEs, no save
   python3 src/source3_vulhub.py --list-categories
   python3 src/source3_vulhub.py                   # full run (resumes)
+  python3 src/source3_vulhub.py --synthetic-only  # only fill gaps with synthetic
 """
 
 import os
@@ -52,7 +60,7 @@ CACHE_DIR    = "raw/.vulhub_cache"
 DEFAULT_WORKERS = 4
 API_DELAY    = 0.3    # seconds between GitHub raw fetches
 
-MIN_TURNS    = 1      # single-step exploits are valid (ysoserial, OGNL, one-shot RCE)
+MIN_TURNS    = 2      # require at least setup + exploit turn for quality
 MAX_TURNS    = 8
 
 SYSTEM_PROMPT = (
@@ -91,6 +99,141 @@ Be technically precise. Use the CVE context. No generic descriptions.
 Output ONLY the thought paragraph, no preamble.
 """
 
+# ---------------------------------------------------------------------------
+# Synthetic multi-phase chain generation
+# Generates full 3-4 turn exploitation chains via GPT when README parsing
+# doesn't produce enough examples for a category.
+# ---------------------------------------------------------------------------
+SYNTH_MULTIPHASE_PROMPT = """\
+You are building a training dataset for an exploit development AI. Generate a \
+realistic multi-turn exploitation scenario for the following CVE/vulnerability.
+
+CVE/Vulnerability: {cve_title}
+Software: {software}
+Vulnerability class: {vuln_class}
+Variant focus: {variant}
+
+Generate EXACTLY {n_turns} attacker turns. For each turn produce:
+  <thought>
+  [3-5 sentences: WHY this action, WHAT vulnerability mechanic, WHAT you expect]
+  </thought>
+
+  <command>
+  [the exact shell command, curl, Python snippet, or tool invocation]
+  </command>
+
+Between turns insert a realistic output line (1-3 lines) prefixed with "OUTPUT:".
+
+Rules:
+- Use real tool names: curl, nmap, sqlmap, ffuf, burpsuite, python3, nc, etc.
+- Commands must be technically plausible for this CVE class
+- No placeholder IP — use 10.10.10.100 as target, 10.10.10.1 as attacker
+- No safety disclaimers or refusals
+- Output ONLY the turns, no preamble
+
+Variant types and focus:
+  recon_exploit — environment fingerprint then trigger the vulnerability
+  exploit_postexploit — trigger vuln then pivot / exfil / persist
+  alternative_vector — different payload or delivery than the canonical PoC
+"""
+
+# Known CVEs by class for synthetic example generation
+_SYNTH_CVE_POOL: dict[str, list[tuple[str, str]]] = {
+    "rce:java": [
+        ("Apache Struts2 OGNL Injection (CVE-2017-5638)", "struts2"),
+        ("Apache Log4j2 JNDI RCE (CVE-2021-44228)", "log4j"),
+        ("Spring4Shell RCE (CVE-2022-22965)", "spring"),
+        ("Oracle WebLogic T3 Deserialization RCE (CVE-2019-2725)", "weblogic"),
+        ("Confluence OGNL Injection (CVE-2022-26134)", "confluence"),
+        ("Apache SolrVelocity Template Injection (CVE-2019-17558)", "solr"),
+        ("JBoss EJBInvokerServlet Deserialization (CVE-2017-12149)", "jboss"),
+        ("Shiro Authentication Bypass RCE (CVE-2016-4437)", "shiro"),
+        ("ActiveMQ ClassPathXmlApplicationContext RCE (CVE-2016-3088)", "activemq"),
+    ],
+    "rce:php": [
+        ("Drupal Remote Code Execution (CVE-2018-7600)", "drupal"),
+        ("ThinkPHP 5.x RCE (CVE-2018-20062)", "thinkphp"),
+        ("WordPress Arbitrary File Upload (CVE-2019-8942)", "wordpress"),
+        ("PHP CGI Remote Code Execution (CVE-2012-1823)", "php"),
+        ("Magento Authenticated RCE (CVE-2019-7139)", "magento"),
+    ],
+    "rce:python": [
+        ("Celery Pickle Deserialization RCE", "celery"),
+        ("Django Debug Page RCE (CVE-2022-28346)", "django"),
+        ("Flask Jinja2 SSTI to RCE", "flask"),
+    ],
+    "rce:node": [
+        ("Node.js vm2 Sandbox Escape (CVE-2023-29017)", "node"),
+        ("Vite SSRF to File Read (CVE-2024-23331)", "vite"),
+        ("npm serialize-javascript XSS/RCE", "npm"),
+    ],
+    "rce:other": [
+        ("GitLab Remote Code Execution (CVE-2021-22205)", "gitlab"),
+        ("Exim SMTP RCE (CVE-2019-10149)", "exim"),
+        ("Redis RCE via SLAVEOF (unauthenticated)", "redis"),
+        ("Samba EternalBlue (CVE-2017-0144)", "samba"),
+        ("Citrix ADC RCE (CVE-2019-19781)", "citrix"),
+        ("VMware vCenter RCE (CVE-2021-21985)", "vcenter"),
+        ("Hadoop YARN REST API RCE", "hadoop"),
+    ],
+    "sqli": [
+        ("MySQL Union-Based SQL Injection via search parameter", "mysql"),
+        ("PostgreSQL Error-Based SQL Injection", "postgresql"),
+        ("MSSQL Blind Time-Based SQL Injection", "mssql"),
+        ("SQLite Boolean-Based Blind SQLi", "sqlite"),
+        ("Oracle SQLi Authentication Bypass", "oracle"),
+    ],
+    "ssrf": [
+        ("SSRF via URL parameter reaching internal metadata service", "httpd"),
+        ("SSRF in PDF generation endpoint leaking AWS credentials", "wkhtmltopdf"),
+        ("SSRF via img src tag in profile upload", "nginx"),
+    ],
+    "xxe": [
+        ("XXE via SAML authentication request", "saml"),
+        ("XXE in XML upload endpoint for SSRF", "java"),
+        ("Blind XXE via OOB DNS exfiltration", "java"),
+    ],
+    "deserialization": [
+        ("Java Deserialization via Apache Commons Collections", "java"),
+        ("Python Pickle Deserialization via Redis cache", "redis"),
+        ("PHP Object Injection via unserialize()", "php"),
+        ("Node.js YAML.load Deserialization RCE", "node"),
+        ("Java Kryo Deserialization in Dubbo (CVE-2021-25641)", "dubbo"),
+    ],
+    "file_upload": [
+        ("Unrestricted PHP webshell upload via image endpoint", "php"),
+        ("ZIP Slip via archive upload endpoint", "java"),
+        ("SVG XSS to SSRF via file upload", "httpd"),
+        ("Polyglot JPEG/PHP file bypass for upload filter", "php"),
+    ],
+    "auth_bypass": [
+        ("JWT Algorithm Confusion auth bypass", "java"),
+        ("SQL Injection authentication bypass via login form", "php"),
+        ("HTTP Basic Auth bypass via path traversal in nginx", "nginx"),
+        ("LDAP injection authentication bypass", "ldap"),
+    ],
+    "path_traversal": [
+        ("Apache HTTP Server Path Traversal (CVE-2021-41773)", "httpd"),
+        ("Nginx alias path traversal to /etc/passwd", "nginx"),
+        ("Zip Slip directory traversal in file extraction", "java"),
+    ],
+    "command_injection": [
+        ("Command injection via ping utility parameter", "php"),
+        ("OS command injection in network diagnostics endpoint", "httpd"),
+        ("Shell metacharacter injection in filename parameter", "bash"),
+        ("Command injection via environment variable in CGI", "cgi"),
+    ],
+    "other": [
+        ("Elasticsearch Remote Code Execution via dynamic scripting", "elasticsearch"),
+        ("Kibana Timelion SSTI RCE (CVE-2019-7609)", "kibana"),
+        ("MongoDB unauthenticated access data exfiltration", "mongodb"),
+        ("Jenkins Script Console RCE via Groovy", "jenkins"),
+        ("Grafana Local File Inclusion (CVE-2021-43798)", "grafana"),
+    ],
+}
+
+_SYNTH_VARIANTS = ["recon_exploit", "exploit_postexploit", "alternative_vector"]
+
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (research/dataset-builder; contact@example.com)",
     "Accept":     "application/vnd.github.v3+json",
@@ -116,24 +259,24 @@ CATEGORIES = [
     "other",
 ]
 
-# Targets calibrated to Vulhub's actual CVE distribution.
+# Targets expanded ~3x from original — gap filled by synthetic generation.
 # Vulhub is Java-heavy (Struts2, Spring, WebLogic, Log4j) — PHP/Python/Node/XXE
-# categories are genuinely sparse in the repo.
+# categories are genuinely sparse in the repo so synthetic fills those gaps.
 BENCH_TARGET_PER_CAT: dict[str, int] = {
-    "rce:java":         50,   # vulhub has 40+ Java RCE READMEs
-    "rce:php":          15,
-    "rce:python":        6,
-    "rce:node":          8,
-    "rce:other":        35,
-    "sqli":             18,
-    "ssrf":             15,
-    "xxe":               8,
-    "deserialization":  35,
-    "file_upload":      20,
-    "auth_bypass":      25,
-    "path_traversal":   15,
-    "command_injection": 15,
-    "other":            25,
+    "rce:java":          150,  # 40+ real READMEs + synthetic variants
+    "rce:php":            45,
+    "rce:python":         18,
+    "rce:node":           24,
+    "rce:other":         100,
+    "sqli":               55,
+    "ssrf":               45,
+    "xxe":                25,
+    "deserialization":   105,
+    "file_upload":        60,
+    "auth_bypass":        75,
+    "path_traversal":     45,
+    "command_injection":  45,
+    "other":              75,
 }
 
 # Software → category mapping
@@ -383,6 +526,155 @@ def generate_thought(
 
 
 # ---------------------------------------------------------------------------
+# Synthetic example generation
+# ---------------------------------------------------------------------------
+def generate_synthetic_example(
+    cve_title: str,
+    software: str,
+    vuln_class: str,
+    variant: str,
+    n_turns: int = 3,
+) -> dict | None:
+    """
+    Ask GPT-4o-mini to produce a full multi-turn exploitation chain and parse
+    the structured output into our training format.
+    """
+    prompt = SYNTH_MULTIPHASE_PROMPT.format(
+        cve_title=cve_title,
+        software=software,
+        vuln_class=vuln_class,
+        variant=variant,
+        n_turns=n_turns,
+    )
+    with _gpt_lock:
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1200,
+                temperature=0.85,
+            )
+        except Exception as e:
+            return None
+    raw = resp.choices[0].message.content.strip()
+
+    # Parse turns from raw output
+    thought_pat = re.compile(r"<thought>(.*?)</thought>", re.DOTALL)
+    command_pat = re.compile(r"<command>(.*?)</command>", re.DOTALL)
+    output_pat  = re.compile(r"^OUTPUT:\s*(.+?)(?=\n\n|<thought>|$)", re.MULTILINE | re.DOTALL)
+
+    thoughts = [t.strip() for t in thought_pat.findall(raw)]
+    commands = [c.strip() for c in command_pat.findall(raw)]
+    outputs  = [o.strip() for o in output_pat.findall(raw)]
+
+    if not thoughts or not commands or len(thoughts) != len(commands):
+        return None
+    if len(thoughts) < 2:
+        return None
+
+    first_user = (
+        f"CVE/Vulnerability: {cve_title}\n"
+        f"Software: {software}\n"
+        f"Class: {vuln_class}\n\n"
+        f"The vulnerable environment is running. What is your first exploitation step?"
+    )
+
+    messages: list[dict] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": first_user},
+    ]
+
+    for i, (thought, cmd) in enumerate(zip(thoughts, commands)):
+        if not cmd.strip():
+            continue
+        asst = f"<thought>\n{thought}\n</thought>\n\n<command>\n{cmd}\n</command>"
+        messages.append({"role": "assistant", "content": asst})
+
+        if i < len(thoughts) - 1:
+            out = outputs[i].strip() if i < len(outputs) else ""
+            if out:
+                next_user = f"Output:\n```\n{out[:600]}\n```\n\nWhat is the next step?"
+            else:
+                next_user = "Command executed successfully. What is the next step?"
+            messages.append({"role": "user", "content": next_user})
+
+    if messages[-1]["role"] != "assistant":
+        messages = messages[:-1]
+
+    n_asst = sum(1 for m in messages if m["role"] == "assistant")
+    if n_asst < MIN_TURNS:
+        return None
+
+    slug = f"synth_{software}_{variant}_{cve_title[:20].replace(' ','_')}"
+    return {
+        "messages": messages,
+        "metadata": {
+            "source":      "vulhub",
+            "software":    software,
+            "vuln_slug":   slug,
+            "cve_title":   cve_title,
+            "category":    vuln_class,
+            "turns":       n_asst,
+            "synthetic":   True,
+            "variant":     variant,
+            "url":         f"https://github.com/vulhub/vulhub",
+        },
+    }
+
+
+def fill_synthetic_gaps(
+    cat_counts: dict[str, int],
+    seen_slugs: set[str],
+    out_file,
+) -> int:
+    """
+    For each category still below its target, generate synthetic examples
+    by cycling through the CVE pool and variant types until the gap is filled.
+    Returns total examples written.
+    """
+    written = 0
+    for cat, target in BENCH_TARGET_PER_CAT.items():
+        current = cat_counts.get(cat, 0)
+        if current >= target:
+            continue
+
+        pool = _SYNTH_CVE_POOL.get(cat, [])
+        if not pool:
+            continue
+
+        needed = target - current
+        print(f"  Synthetic fill: {cat} needs {needed} more examples")
+
+        variant_cycle = 0
+        cve_cycle = 0
+        attempts = 0
+        while cat_counts.get(cat, 0) < target and attempts < needed * 4:
+            attempts += 1
+            cve_title, software = pool[cve_cycle % len(pool)]
+            variant = _SYNTH_VARIANTS[variant_cycle % len(_SYNTH_VARIANTS)]
+            cve_cycle += 1
+            variant_cycle += 1
+
+            slug = f"synth_{software}_{variant}_{cve_cycle}"
+            if slug in seen_slugs:
+                continue
+
+            n_turns = random.choice([2, 3, 3, 4])
+            ex = generate_synthetic_example(cve_title, software, cat, variant, n_turns)
+            if ex:
+                ex["metadata"]["vuln_slug"] = slug
+                out_file.write(json.dumps(ex) + "\n")
+                out_file.flush()
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+                seen_slugs.add(slug)
+                written += 1
+
+            time.sleep(0.2)
+
+    return written
+
+
+# ---------------------------------------------------------------------------
 # Build one training example from a parsed README
 # ---------------------------------------------------------------------------
 def build_example(
@@ -605,12 +897,14 @@ def print_progress(counts: dict[str, int]) -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test",      action="store_true", help="Test mode — 5 CVEs")
-    parser.add_argument("--test-n",    type=int, default=5)
+    parser.add_argument("--test",           action="store_true", help="Test mode — 5 CVEs")
+    parser.add_argument("--test-n",         type=int, default=5)
     parser.add_argument("--list-categories", action="store_true")
-    parser.add_argument("--out",       default=OUTPUT_PATH)
-    parser.add_argument("--no-resume", action="store_true")
-    parser.add_argument("--workers",   type=int, default=DEFAULT_WORKERS)
+    parser.add_argument("--out",            default=OUTPUT_PATH)
+    parser.add_argument("--no-resume",      action="store_true")
+    parser.add_argument("--workers",        type=int, default=DEFAULT_WORKERS)
+    parser.add_argument("--synthetic-only", action="store_true",
+                        help="Skip README pass, only fill gaps with synthetic examples")
     args = parser.parse_args()
 
     if args.list_categories:
@@ -656,69 +950,85 @@ def main() -> None:
     cat_counts   = load_existing_counts(args.out) if resume else {c: 0 for c in CATEGORIES}
     seen_slugs   = load_existing_slugs(args.out)  if resume else set()
 
-    # Filter to unseen entries with capacity
     total_target = sum(BENCH_TARGET_PER_CAT.values())
     total_done   = sum(cat_counts.values())
-    if total_done >= total_target:
-        print("All categories already at target. Nothing to do.")
-        print_progress(cat_counts)
-        return
-
-    # Shuffle for diversity then sort: categories with most deficit first
-    random.shuffle(all_entries)
-    entries_todo = [
-        e for e in all_entries
-        if e["vuln_slug"] not in seen_slugs
-    ]
-
-    print(f"Entries to process: {len(entries_todo)}  (already done: {len(seen_slugs)})")
-    print_progress(cat_counts)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-
-    def _worker(entry: dict) -> dict | None:
-        slug = entry["vuln_slug"]
-        if slug in seen_slugs:
-            return None
-        time.sleep(API_DELAY)
-        result = process_entry(entry, cat_counts, generate_thoughts=True, max_thoughts=99)
-        if result:
-            seen_slugs.add(slug)
-        return result
-
     written = 0
-    pbar_extra = {cat[:6]: 0 for cat in CATEGORIES}
 
-    def _update_pbar(ex: dict):
-        cat = ex["metadata"].get("category", "?")[:6]
-        pbar_extra[cat] = pbar_extra.get(cat, 0) + 1
+    # ── Phase 1: README-based pass ─────────────────────────────────────────
+    if not args.synthetic_only:
+        print("Fetching Vulhub repository tree...")
+        all_entries = get_vulhub_readmes()
+        print(f"Found {len(all_entries)} CVE/vulnerability scenarios\n")
 
-    with open(args.out, "a") as outf:
-        with tqdm(total=total_target - total_done,
-                  desc="Vulhub CVEs",
-                  dynamic_ncols=True) as pbar:
-            with ThreadPoolExecutor(max_workers=args.workers) as pool:
-                futures = {pool.submit(_worker, e): e for e in entries_todo}
-                for fut in as_completed(futures):
-                    result = fut.result()
-                    if result:
-                        outf.write(json.dumps(result) + "\n")
-                        outf.flush()
-                        written += 1
-                        _update_pbar(result)
-                        cat = result["metadata"]["category"]
-                        pbar.set_postfix({c[:6]: v for c, v in pbar_extra.items() if v > 0})
-                        pbar.update(1)
+        if total_done >= total_target:
+            print("All categories already at target. Skipping README pass.")
+        else:
+            random.shuffle(all_entries)
+            entries_todo = [e for e in all_entries if e["vuln_slug"] not in seen_slugs]
+            print(f"Entries to process: {len(entries_todo)}  (already done: {len(seen_slugs)})")
+            print_progress(cat_counts)
 
-                    # Stop when all targets met
-                    all_met = all(
-                        cat_counts.get(cat, 0) >= BENCH_TARGET_PER_CAT.get(cat, 0)
-                        for cat in BENCH_TARGET_PER_CAT
-                    )
-                    if all_met:
-                        break
+            def _worker(entry: dict) -> dict | None:
+                slug = entry["vuln_slug"]
+                if slug in seen_slugs:
+                    return None
+                time.sleep(API_DELAY)
+                result = process_entry(entry, cat_counts, generate_thoughts=True, max_thoughts=99)
+                if result:
+                    seen_slugs.add(slug)
+                return result
 
-    print(f"\nDone. Wrote {written} new examples.")
+            pbar_extra: dict[str, int] = {cat[:6]: 0 for cat in CATEGORIES}
+
+            def _update_pbar(ex: dict) -> None:
+                cat = ex["metadata"].get("category", "?")[:6]
+                pbar_extra[cat] = pbar_extra.get(cat, 0) + 1
+
+            readme_total = total_target - total_done
+            with open(args.out, "a") as outf:
+                with tqdm(total=readme_total, desc="Vulhub CVEs", dynamic_ncols=True) as pbar:
+                    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                        futures = {pool.submit(_worker, e): e for e in entries_todo}
+                        for fut in as_completed(futures):
+                            result = fut.result()
+                            if result:
+                                outf.write(json.dumps(result) + "\n")
+                                outf.flush()
+                                written += 1
+                                _update_pbar(result)
+                                pbar.set_postfix(
+                                    {c[:6]: v for c, v in pbar_extra.items() if v > 0}
+                                )
+                                pbar.update(1)
+
+                            all_met = all(
+                                cat_counts.get(c, 0) >= BENCH_TARGET_PER_CAT.get(c, 0)
+                                for c in BENCH_TARGET_PER_CAT
+                            )
+                            if all_met:
+                                break
+
+            print(f"\nREADME pass done. Wrote {written} new examples.")
+            print_progress(load_existing_counts(args.out))
+
+    # ── Phase 2: Synthetic gap-fill ────────────────────────────────────────
+    cat_counts   = load_existing_counts(args.out)
+    seen_slugs   = load_existing_slugs(args.out)
+    gaps = {c: BENCH_TARGET_PER_CAT[c] - cat_counts.get(c, 0) for c in BENCH_TARGET_PER_CAT}
+    total_gap = sum(max(0, v) for v in gaps.values())
+
+    if total_gap > 0:
+        print(f"\nStarting synthetic gap-fill: {total_gap} examples needed")
+        with open(args.out, "a") as outf:
+            synth_written = fill_synthetic_gaps(cat_counts, seen_slugs, outf)
+        written += synth_written
+        print(f"Synthetic fill done. Wrote {synth_written} synthetic examples.")
+    else:
+        print("No synthetic gap-fill needed — all categories at target.")
+
+    print(f"\nTotal written this run: {written}")
     print_progress(load_existing_counts(args.out))
 
 
