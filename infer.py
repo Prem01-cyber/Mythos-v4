@@ -18,6 +18,7 @@ Usage:
     python3 infer.py --adapter vulhub --case 2
     python3 infer.py --adapter attack --interactive
     python3 infer.py --model outputs/mythos-v4-htb/merged-bf16  # custom path
+    python3 infer.py --adapter htb --backend vllm               # vLLM (requires compat fix)
 """
 
 import os
@@ -75,7 +76,7 @@ parser.add_argument("--case",       type=int, default=None,
                     help="Run only test case N (0-indexed)")
 parser.add_argument("--save",       default=None,
                     help="Output path prefix — auto-appends _raw.jsonl")
-parser.add_argument("--backend",    default="vllm", choices=["vllm", "hf"])
+parser.add_argument("--backend",    default="hf", choices=["vllm", "hf"])
 args = parser.parse_args()
 
 # Resolve adapter → model path
