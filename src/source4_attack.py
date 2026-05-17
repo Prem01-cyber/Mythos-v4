@@ -82,40 +82,39 @@ SYSTEM_PROMPT = (
     "<command>mimikatz # sekurlsa::logonpasswords</command>"
 )
 
-# ATT&CK tactic → category label
-TACTIC_MAP = {
-    "initial-access":          "initial-access",
-    "execution":               "execution",
-    "persistence":             "persistence",
-    "privilege-escalation":    "privilege-escalation",
-    "defense-evasion":         "defense-evasion",
-    "credential-access":       "credential-access",
-    "discovery":               "discovery",
-    "lateral-movement":        "lateral-movement",
-    "collection":              "collection",
-    "command-and-control":     "command-and-control",
-    "exfiltration":            "exfiltration",
-    "impact":                  "impact",
-    "reconnaissance":          "reconnaissance",
-    "resource-development":    "resource-development",
+# Normalize old/non-standard STIX kill_chain phase names → current ATT&CK tactic slugs.
+# The cached STIX bundle (mitre/cti) uses legacy names like "stealth" instead of
+# "defense-evasion".  This map corrects them at load-time so the filter logic below
+# works correctly.
+STIX_TACTIC_NORM: dict[str, str] = {
+    "stealth":              "defense-evasion",
+    "defense-impairment":   "defense-evasion",
+    # underscore → hyphen variants
+    "lateral_movement":     "lateral-movement",
+    "command_and_control":  "command-and-control",
+    "privilege_escalation": "privilege-escalation",
+    "credential_access":    "credential-access",
+    "initial_access":       "initial-access",
 }
 
-# Balanced targets — reflect realistic ATT&CK distribution
+# Balanced targets — calibrated against actual Atomic Red Team technique coverage.
+# Targets are capped at ~80-90% of estimated maximum possible (technique_ids × avg_tests).
+# "resource-development" omitted: Atomic Red Team has zero tests for T1583-T1588 etc.
+# (pre-compromise infra techniques that can't be expressed as runnable CLI commands).
 BENCH_TARGET_PER_CAT: dict[str, int] = {
-    "initial-access":         50,
-    "execution":              80,
-    "persistence":            70,
-    "privilege-escalation":   70,
-    "defense-evasion":        90,
-    "credential-access":      70,
-    "discovery":              80,
-    "lateral-movement":       50,
-    "collection":             40,
-    "command-and-control":    50,
-    "exfiltration":           40,
-    "impact":                 40,
-    "reconnaissance":         30,
-    "resource-development":   20,
+    "execution":              80,   # 29 IDs × ~3 tests = ~87 max; current=82
+    "discovery":              80,   # 34 IDs × ~3 tests = ~102 max; current=82
+    "credential-access":      70,   # 37 IDs × ~2 tests = ~74 max; current=70
+    "persistence":            70,   # 43 IDs × ~2 tests = ~86 max; current=70
+    "privilege-escalation":   70,   # 19 IDs × ~4 tests = ~76 max; current=70
+    "defense-evasion":        90,   # 105 IDs available — was 0 due to STIX name bug, now fixed
+    "command-and-control":    50,   # 14 IDs × ~4 tests = ~56 max; current=50
+    "collection":             40,   # 19 IDs × ~3 tests = ~57 max; current=43
+    "impact":                 40,   # 8 IDs × ~5 tests = ~40 max; current=40
+    "lateral-movement":       30,   # 11 IDs × ~3 tests = ~33 max; current=24
+    "exfiltration":           25,   # 8 IDs × ~3 tests = ~24 max; current=23
+    "initial-access":         15,   # 5 IDs × ~3 tests = ~15 max; current=7
+    "reconnaissance":         10,   # 2 IDs × ~4 tests = ~8 max; current=2
 }
 
 THOUGHT_PROMPT = """\
@@ -228,8 +227,10 @@ def _gpt(prompt: str, max_tokens: int = 400, model: str = "gpt-4o-mini") -> str:
             time.sleep(2 ** attempt)
 
 
-def _fill_args(command: str, input_arguments: dict) -> str:
+def _fill_args(command: str | None, input_arguments: dict) -> str:
     """Replace #{arg_name} placeholders with their default values."""
+    if not command:  # handles None (YAML `null`) and empty string
+        return ""
     if not input_arguments:
         return command
     for arg_name, arg_info in input_arguments.items():
@@ -320,7 +321,7 @@ def fetch_atomic_tests(technique_id: str) -> list[dict]:
             "executor":         executor.get("name", "sh"),
             "command":          cmd,
             "cleanup_command":  _fill_args(
-                                    executor.get("cleanup_command", ""),
+                                    executor.get("cleanup_command") or "",
                                     t.get("input_arguments", {}),
                                 ),
             "input_arguments":  t.get("input_arguments", {}),
@@ -332,46 +333,73 @@ def fetch_atomic_tests(technique_id: str) -> list[dict]:
 # STIX tactic lookup (cached)
 # ---------------------------------------------------------------------------
 _tactic_cache: dict[str, list[str]] = {}
+_names_cache:  dict[str, str]       = {}
 
-def _load_stix_tactics() -> dict[str, list[str]]:
-    """Return {technique_id: [tactic1, tactic2, ...]} from MITRE STIX."""
-    global _tactic_cache
+def _norm_tactics(tactics: list[str]) -> list[str]:
+    """Apply STIX_TACTIC_NORM to fix legacy/non-standard phase names."""
+    return [STIX_TACTIC_NORM.get(t, t) for t in tactics]
+
+
+def _load_stix_tactics() -> tuple[dict[str, list[str]], dict[str, str]]:
+    """
+    Return ({technique_id: [tactic, ...]}, {technique_id: display_name}) from MITRE STIX.
+
+    Normalizes old kill_chain phase names (e.g. "stealth" → "defense-evasion") so
+    that previously-silenced tactics are correctly matched by BENCH_TARGET_PER_CAT.
+    """
+    global _tactic_cache, _names_cache
     if _tactic_cache:
-        return _tactic_cache
-    stix_url = ("https://raw.githubusercontent.com/mitre/cti/master/"
-                "enterprise-attack/enterprise-attack.json")
-    cache_p  = Path(CACHE_DIR) / "stix_tactics.json"
-    if cache_p.exists():
-        _tactic_cache = json.loads(cache_p.read_text())
-        return _tactic_cache
+        return _tactic_cache, _names_cache
 
-    print("  Downloading STIX data for tactic mapping…")
+    stix_url   = ("https://raw.githubusercontent.com/mitre/cti/master/"
+                  "enterprise-attack/enterprise-attack.json")
+    tactic_p   = Path(CACHE_DIR) / "stix_tactics.json"
+    names_p    = Path(CACHE_DIR) / "stix_names.json"
+
+    if tactic_p.exists() and names_p.exists():
+        raw_tactics = json.loads(tactic_p.read_text())
+        # Always apply normalization at load time (handles stale caches)
+        _tactic_cache = {k: _norm_tactics(v) for k, v in raw_tactics.items()}
+        _names_cache  = json.loads(names_p.read_text())
+        return _tactic_cache, _names_cache
+
+    print("  Downloading STIX data for tactic + name mapping…")
     r = requests.get(stix_url, timeout=60)
     r.raise_for_status()
     stix = r.json()
 
-    result: dict[str, list[str]] = {}
+    tactics_raw: dict[str, list[str]] = {}
+    names_raw:   dict[str, str]       = {}
+
     for obj in stix.get("objects", []):
         if obj.get("type") != "attack-pattern":
             continue
         refs = obj.get("external_references", [])
         t_id = next(
-            (r["external_id"] for r in refs if r.get("source_name") == "mitre-attack"),
+            (ref["external_id"] for ref in refs if ref.get("source_name") == "mitre-attack"),
             None,
         )
         if not t_id:
             continue
+
         tactics = [
             p["phase_name"]
             for p in obj.get("kill_chain_phases", [])
             if p.get("kill_chain_name") == "mitre-attack"
         ]
         if tactics:
-            result[t_id] = tactics
+            tactics_raw[t_id] = tactics
 
-    cache_p.write_text(json.dumps(result))
-    _tactic_cache = result
-    return result
+        display = obj.get("name", "")
+        if display:
+            names_raw[t_id] = display
+
+    tactic_p.write_text(json.dumps(tactics_raw))
+    names_p.write_text(json.dumps(names_raw))
+
+    _tactic_cache = {k: _norm_tactics(v) for k, v in tactics_raw.items()}
+    _names_cache  = names_raw
+    return _tactic_cache, _names_cache
 
 
 # ---------------------------------------------------------------------------
@@ -568,9 +596,9 @@ def main() -> None:
     Path("raw").mkdir(exist_ok=True)
     Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
 
-    # Load tactic mapping from STIX
+    # Load tactic + name mapping from STIX
     print("Loading ATT&CK tactic mapping from STIX…")
-    tactic_map = _load_stix_tactics()
+    tactic_map, names_map = _load_stix_tactics()
 
     # Fetch technique list from Atomic Red Team
     print("Fetching Atomic Red Team technique list…")
@@ -578,17 +606,17 @@ def main() -> None:
     print(f"  Found {len(technique_ids)} techniques in atomics/")
 
     # Map each technique to its primary tactic
-    techniques: list[tuple[str, str, str]] = []  # (id, name, tactic)
+    techniques: list[tuple[str, str, str]] = []  # (id, display_name, tactic)
     for tid in technique_ids:
         tactics = tactic_map.get(tid, [])
         if not tactics:
             continue
-        # Prefer the first tactic (primary)
-        tactic = tactics[0]
-        if tactic not in BENCH_TARGET_PER_CAT:
+        # Prefer the first tactic (primary) that is in our target categories
+        tactic = next((t for t in tactics if t in BENCH_TARGET_PER_CAT), None)
+        if tactic is None:
             continue
-        # Technique display name — derive from STIX or just use the ID
-        techniques.append((tid, tid, tactic))
+        display_name = names_map.get(tid, tid)
+        techniques.append((tid, display_name, tactic))
 
     random.shuffle(techniques)
 

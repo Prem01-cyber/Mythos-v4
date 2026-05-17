@@ -844,6 +844,252 @@ def build_htb_dataset(
 
 
 # ---------------------------------------------------------------------------
+# Supplemental hard/insane machine list
+# Used when 0xdf scraping cannot fill hard/insane category targets.
+# GPT generates a realistic multi-turn exploitation walkthrough using its
+# training knowledge of each specific machine.
+# ---------------------------------------------------------------------------
+
+# (machine_name, os, difficulty, key_vulnerability_hint)
+HARD_INSANE_MACHINES: list[tuple[str, str, str, str]] = [
+    # --- Linux Hard ---
+    ("Craft",        "linux", "hard",   "Gogs CVE, SSTI, Vault secrets"),
+    ("Travel",       "linux", "hard",   "SSRF to Memcached, GitWeb, deserialization"),
+    ("SneakyMailer", "linux", "hard",   "phishing, IMAP, PyPI package hijack"),
+    ("Crossfit2",    "linux", "hard",   "XSS, WebSockets, sudo nsupdate DNS"),
+    ("Undetected",   "linux", "hard",   "PHP backdoor in vendor, Apache module rootkit"),
+    ("Vessel",       "linux", "hard",   "Node.js injection, PDF exfil, password-protected binary"),
+    ("Forge",        "linux", "hard",   "SSRF to internal admin, FTP bypass"),
+    ("Backdoor",     "linux", "hard",   "WordPress plugin LFI, gdbserver RCE"),
+    ("Pollution",    "linux", "hard",   "NoSQL injection, PHP filter chain"),
+    ("UpDown",       "linux", "hard",   ".shtml SSI injection, proc/fd LFI, sudo easy_install"),
+    ("Awkward",      "linux", "hard",   "JWT forgery, SSRF, bcrypt timing attack"),
+    ("Download",     "linux", "hard",   "Prisma path traversal, SUID tar"),
+    ("Coder",        "linux", "hard",   "Gitea actions RCE, Teampass, PowerShell encrypted credential"),
+    ("Derailed",     "linux", "hard",   "XSS to admin cookie, RailsAdmin route, openmediavault"),
+    ("Gofer",        "linux", "hard",   "SSRF via Gopher, LibreOffice macro, sudo tbf"),
+    # --- Linux Insane ---
+    ("Crossfit",     "linux", "insane", "XSS CSP bypass, FTP MITM, nsupdate privilege escalation"),
+    ("Rope",         "linux", "insane", "ret2csu ROP chain, PHP source leak, rbash escape"),
+    ("Player",       "linux", "insane", "SSRF, JWT RS→HS confusion, FFmpeg HLS SSRF"),
+    ("Patents",      "linux", "insane", "SSRF XXE, Golang binary reverse engineering"),
+    ("Fighter",      "linux", "insane", "OSTicket SQLi, kernel exploit, IOCTL"),
+    ("Zipper",       "linux", "insane", "Zabbix API, bypass 2FA, SUID binary"),
+    ("Olympus",      "linux", "insane", "Aircrack-ng PCAP, Xdebug RCE, Docker breakout"),
+    # --- Windows Hard ---
+    ("Sizzle",       "windows", "hard", "ADCS ESC1, Kerberoasting, WinRM"),
+    ("Cascade",      "windows", "hard", "LDAP legacy password, AD recycle bin, .NET reversing"),
+    ("Oouch",        "windows", "hard", "OAuth CSRF, SSRF, iptables, D-Bus"),
+    ("Worker",       "windows", "hard", "SVN plaintext creds, Azure DevOps pipeline RCE"),
+    ("Proper",       "windows", "hard", "RPC DCOM, SQL injection, UNC path injection"),
+    ("Sharp",        "windows", "hard", ".NET WCF RCE, SeImpersonatePrivilege, RoguePotato"),
+    ("Atom",         "windows", "hard", "Electron auto-updater YAML, Redis, Kanban plaintext"),
+    ("Object",       "windows", "hard", "Jenkins script console, AD ACL abuse, ForceChangePassword"),
+    ("Streamio",     "windows", "hard", "MSSQL injection, FFmpeg SSRF, AppLocker bypass"),
+    ("Search",       "windows", "hard", "ADCS ESC8, Excel password spray, ReadGMSAPassword"),
+    ("Intelligence", "windows", "hard", "Azure ADCS, Kerberos delegation, GMSA"),
+    ("Return",       "windows", "hard", "printer LDAP credential capture, SeBackupPrivilege"),
+]
+
+def _gpt(prompt: str, max_tokens: int = 800) -> str:
+    """Thin wrapper around client.chat.completions for one-shot generation."""
+    for attempt in range(3):
+        try:
+            r = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=max_tokens,
+            )
+            return r.choices[0].message.content.strip()
+        except Exception:
+            if attempt == 2:
+                return ""
+            time.sleep(2 ** attempt)
+    return ""
+
+
+SYNTH_WRITEUP_PROMPT = """\
+You are a HackTheBox expert generating a realistic penetration testing walkthrough.
+
+Machine: {name} (HTB, {os_label}, {difficulty})
+Key Vulnerability Path: {hint}
+
+Generate a realistic multi-phase exploitation walkthrough for this machine.
+Write {n_turns} turns of a penetration testing session for the "{phase}" phase.
+
+Each turn must follow this EXACT format:
+USER_OUTPUT: <realistic terminal/service output that was seen>
+THOUGHT: <2-4 sentences of attacker reasoning, second-person ("You notice...", "This suggests...")>
+COMMAND: <exact shell/tool command the attacker runs next>
+
+Rules:
+- Use real tool names: nmap, gobuster, ffuf, hydra, evil-winrm, impacket, crackmapexec, etc.
+- Use realistic IPs (10.10.10.x for HTB), ports, hashes, usernames
+- Commands must be technically correct and specific to {name}
+- Make the command chain logically follow from the output
+- No disclaimers, no refusals
+
+Start with the first USER_OUTPUT as the initial observation or nmap result.
+Output ONLY the turns, no preamble.
+"""
+
+def _parse_synth_turns(raw: str, context_prefix: str) -> list[dict]:
+    """Parse THOUGHT/COMMAND pairs from synthetic writeup GPT output."""
+    turns = []
+    # Split on USER_OUTPUT: blocks
+    blocks = re.split(r"USER_OUTPUT:", raw, flags=re.IGNORECASE)
+    for block in blocks:
+        if not block.strip():
+            continue
+        thought_m = re.search(r"THOUGHT:\s*(.+?)(?=COMMAND:|$)", block, re.DOTALL | re.IGNORECASE)
+        cmd_m     = re.search(r"COMMAND:\s*(.+?)(?=USER_OUTPUT:|THOUGHT:|$)", block, re.DOTALL | re.IGNORECASE)
+        output_end = re.match(r"(.+?)(?=THOUGHT:)", block, re.DOTALL | re.IGNORECASE)
+
+        out_text  = output_end.group(1).strip() if output_end else ""
+        thought   = thought_m.group(1).strip() if thought_m else ""
+        cmd       = cmd_m.group(1).strip() if cmd_m else ""
+
+        if thought and cmd and len(cmd.split()) >= 2:
+            turns.append({
+                "output":  out_text[:600],
+                "thought": thought[:600],
+                "command": cmd[:400],
+            })
+    return turns
+
+
+def generate_synthetic_htb_example(
+    name: str, os_label: str, difficulty: str, hint: str,
+    phase: str = "Enumeration",
+) -> dict | None:
+    """Generate one synthetic HTB training example using GPT domain knowledge."""
+    is_ad     = any(kw in hint.lower() for kw in ("ad", "kerberos", "domain", "ldap", "gpo", "dcsync", "asrep"))
+    category  = "windows:ad" if (is_ad and os_label == "windows") else f"{os_label}:{difficulty}"
+
+    if category not in BENCH_TARGET_PER_CAT:
+        return None
+
+    n_turns = random.randint(4, 7)
+    try:
+        raw = _gpt(SYNTH_WRITEUP_PROMPT.format(
+            name=name, os_label=os_label, difficulty=difficulty,
+            hint=hint, phase=phase, n_turns=n_turns,
+        ), max_tokens=1200)
+    except Exception:
+        return None
+
+    if not raw:
+        return None
+
+    turns = _parse_synth_turns(raw, f"Target: {name} ({os_label.capitalize()}, {difficulty.capitalize()})\nPhase: {phase}")
+    if len(turns) < MIN_TURNS:
+        return None
+
+    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.append({
+        "role": "user",
+        "content": (
+            f"Target: {name} (HackTheBox, {os_label.capitalize()}, {difficulty.capitalize()})\n"
+            f"Phase: {phase}\n\nWhat is your first action?"
+        ),
+    })
+
+    for i, turn in enumerate(turns[:MAX_TURNS]):
+        asst_content = (
+            f"<thought>\n{turn['thought']}\n</thought>\n\n"
+            f"<command>\n{turn['command']}\n</command>"
+        )
+        messages.append({"role": "assistant", "content": asst_content})
+
+        if i < len(turns) - 1:
+            nxt_out = turns[i + 1]["output"] or "(no output)"
+            messages.append({
+                "role": "user",
+                "content": f"Output:\n```\n{nxt_out}\n```\n\nWhat is the next action?",
+            })
+
+    return {
+        "messages": messages,
+        "metadata": {
+            "source":       "htb_writeup",
+            "machine_name": name,
+            "os":           os_label,
+            "difficulty":   difficulty,
+            "is_ad":        is_ad,
+            "category":     category,
+            "phase":        phase,
+            "synthetic":    True,
+        },
+    }
+
+
+def fill_hardinsane_gaps(
+    output_path: str,
+    targets: dict[str, int],
+    workers: int = DEFAULT_WORKERS,
+) -> None:
+    """
+    After 0xdf scraping, fill remaining hard/insane gaps from the curated machine list.
+    Only runs for categories still below target.
+    """
+    cat_counts = load_existing_counts(output_path)
+    gap_cats   = {c for c in ("linux:hard", "linux:insane", "windows:hard")
+                  if cat_counts.get(c, 0) < targets.get(c, 0)}
+    if not gap_cats:
+        return
+
+    print(f"\nFilling hard/insane gaps for: {', '.join(sorted(gap_cats))}")
+
+    # Filter machines to only the needed categories
+    machines = [
+        m for m in HARD_INSANE_MACHINES
+        if f"{m[1]}:{m[2]}" in gap_cats
+    ]
+    random.shuffle(machines)
+
+    counts_lock = threading.Lock()
+
+    PHASES = ["Enumeration", "Foothold", "Privilege Escalation"]
+
+    def _gen(machine: tuple) -> int:
+        name, os_label, diff, hint = machine
+        category = f"{os_label}:{diff}"
+        added = 0
+        for phase in PHASES:
+            with counts_lock:
+                if cat_counts.get(category, 0) >= targets.get(category, 0):
+                    return added
+            ex = generate_synthetic_htb_example(name, os_label, diff, hint, phase)
+            if ex is None:
+                continue
+            with counts_lock:
+                if cat_counts.get(category, 0) >= targets.get(category, 0):
+                    return added
+                with open(output_path, "a") as f:
+                    f.write(json.dumps(ex, ensure_ascii=False) + "\n")
+                cat_counts[category] = cat_counts.get(category, 0) + 1
+                added += 1
+        return added
+
+    total_gap = sum(
+        max(0, targets.get(f"{m[1]}:{m[2]}", 0) - cat_counts.get(f"{m[1]}:{m[2]}", 0))
+        for m in machines
+    )
+    pbar = tqdm(total=total_gap, desc="Synthetic hard/insane", unit="phase")
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(_gen, m): m for m in machines}
+        for fut in as_completed(futs):
+            pbar.update(fut.result())
+
+    pbar.close()
+    print("\nFinal hard/insane counts after supplemental generation:")
+    for cat in sorted(gap_cats):
+        print(f"  {cat:<20} {cat_counts.get(cat, 0)}/{targets.get(cat, 0)}")
+
+
+# ---------------------------------------------------------------------------
 # Test mode  (5 machines, no saves, shows extracted data)
 # ---------------------------------------------------------------------------
 
@@ -950,6 +1196,13 @@ def main() -> None:
         output_path = args.output,
         workers     = args.workers,
         resume      = not args.no_resume,
+    )
+
+    # Fill any remaining hard/insane gaps that 0xdf couldn't cover
+    fill_hardinsane_gaps(
+        output_path = args.output,
+        targets     = targets,
+        workers     = args.workers,
     )
 
 
