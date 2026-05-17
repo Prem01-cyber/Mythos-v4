@@ -9,7 +9,16 @@ Reads (in order):
   raw/attack.jsonl            Source 4 — MITRE ATT&CK red team technique chains
 
 Writes:
-  processed/combined.jsonl    Merged, shuffled, token-truncated training set
+  processed/htb_writeups.jsonl   Processed HTB examples  (pushed to git)
+  processed/vulhub.jsonl         Processed Vulhub examples
+  processed/attack.jsonl         Processed ATT&CK examples
+  processed/combined.jsonl       All sources merged + shuffled
+
+Per-source max_tokens (matched to actual token distributions):
+  exploitdb  → 2048  (max 2043 — already fits perfectly)
+  htb        → 4096  (max 4062 — long multi-turn pentest chains)
+  vulhub     → 3000  (98.7% fit; 2 extreme outliers dropped)
+  attack     → 2048  (max 1174 — compact technique scenarios)
 
 Multi-turn truncation strategy (Sources 2–4):
   1. Total ≤ MAX_TOKENS → keep as-is
@@ -18,10 +27,9 @@ Multi-turn truncation strategy (Sources 2–4):
   3. Still over → truncate last assistant message at token boundary
 
 Usage:
-  python3 prepare_data.py                        # merge all available sources
-  python3 prepare_data.py --max-tokens 2048
+  python3 prepare_data.py                        # process all sources + write combined
   python3 prepare_data.py --dry-run              # stats only, no write
-  python3 prepare_data.py --source exploitdb     # single-source processed file
+  python3 prepare_data.py --source htb           # process only HTB → processed/htb_writeups.jsonl
 """
 
 import json
@@ -39,18 +47,20 @@ MSG_OVERHEAD  = 4     # role + separators per message
 REPLY_PRIMER  = 2     # assistant reply primer
 ENCODING      = "gpt-4o"
 
+# (raw_input, source_label, max_tokens, processed_output)
+# max_tokens tuned to each source's actual distribution (see inspect_tokens.py)
 SOURCES = [
-    ("processed/exploitdb.jsonl", "exploitdb"),       # Source 1 — exploit code + reasoning
-    ("raw/htb_writeups.jsonl",    "htb_writeup"),     # Source 2 — HTB pentest methodology
-    ("raw/vulhub.jsonl",          "vulhub"),           # Source 3 — Vulhub CVE exploitation
-    ("raw/attack.jsonl",          "mitre_attack"),     # Source 4 — ATT&CK red team techniques
+    ("processed/exploitdb.jsonl", "exploitdb",    2048, "processed/exploitdb.jsonl"),
+    ("raw/htb_writeups.jsonl",    "htb_writeup",  4096, "processed/htb_writeups.jsonl"),
+    ("raw/vulhub.jsonl",          "vulhub",        3000, "processed/vulhub.jsonl"),
+    ("raw/attack.jsonl",          "mitre_attack",  2048, "processed/attack.jsonl"),
 ]
 
 SOURCE_FILTER = {
-    "exploitdb":    "processed/exploitdb.jsonl",
-    "htb":         "raw/htb_writeups.jsonl",
-    "vulhub":      "raw/vulhub.jsonl",
-    "attack":      "raw/attack.jsonl",
+    "exploitdb": 0,
+    "htb":       1,
+    "vulhub":    2,
+    "attack":    3,
 }
 
 OUTPUT_PATH = "processed/combined.jsonl"
@@ -140,86 +150,104 @@ def truncate_example(example: dict, max_tokens: int) -> dict | None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def process_source(
+    path_str: str,
+    source_label: str,
+    max_tokens: int,
+    out_path: str | None,
+    dry_run: bool,
+) -> list[dict]:
+    """Load, truncate, and optionally write one source. Returns kept examples."""
+    path = Path(path_str)
+    if not path.exists():
+        print(f"  [SKIP] {path_str} — not found (run source script first)\n")
+        return []
+
+    with open(path) as f:
+        raw = [json.loads(l) for l in f if l.strip()]
+
+    kept_examples = []
+    skipped = truncated = 0
+    tokens_before: list[int] = []
+    tokens_after:  list[int] = []
+
+    for ex in raw:
+        tb = _count_example(ex)
+        tokens_before.append(tb)
+
+        result = truncate_example(ex, max_tokens)
+        if result is None:
+            skipped += 1
+            continue
+
+        ta = _count_example(result)
+        tokens_after.append(ta)
+        if ta < tb:
+            truncated += 1
+        kept_examples.append(result)
+
+    print(f"  Source : {source_label}  ({path_str})  [limit={max_tokens}]")
+    print(f"    Raw      : {len(raw)}")
+    print(f"    Kept     : {len(kept_examples)}")
+    print(f"    Truncated: {truncated}  ({100*truncated/max(1,len(kept_examples)):.0f}%)")
+    print(f"    Skipped  : {skipped}")
+    if tokens_before:
+        print(f"    Before   : min={min(tokens_before)}  "
+              f"median={statistics.median(tokens_before):.0f}  "
+              f"max={max(tokens_before)}")
+    if tokens_after:
+        print(f"    After    : min={min(tokens_after)}  "
+              f"median={statistics.median(tokens_after):.0f}  "
+              f"max={max(tokens_after)}")
+
+    # Write individual processed file (skip for exploitdb — already in processed/)
+    if out_path and out_path != path_str and not dry_run and kept_examples:
+        Path("processed").mkdir(exist_ok=True)
+        with open(out_path, "w") as f:
+            for ex in kept_examples:
+                f.write(json.dumps(ex) + "\n")
+        print(f"    → Written : {out_path}  ({len(kept_examples)} examples)")
+    print()
+    return kept_examples
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max-tokens", type=int, default=2048,
-                        help="Context limit per example (default: 2048)")
-    parser.add_argument("--seed",       type=int, default=42)
-    parser.add_argument("--dry-run",    action="store_true",
+    parser.add_argument("--seed",    type=int, default=42)
+    parser.add_argument("--dry-run", action="store_true",
                         help="Print stats only — do not write output")
-    parser.add_argument("--source",     choices=list(SOURCE_FILTER.keys()), default=None,
-                        help="Process a single source only (optional)")
+    parser.add_argument("--source",  choices=list(SOURCE_FILTER.keys()), default=None,
+                        help="Process a single source only (writes processed/<source>.jsonl)")
     args = parser.parse_args()
 
     random.seed(args.seed)
 
     print(f"\n{'═' * 60}")
     print(f"  Mythos-v4 — prepare_data.py")
-    print(f"  Max tokens : {args.max_tokens}")
-    print(f"  Output     : {OUTPUT_PATH}")
+    print(f"  Output : {OUTPUT_PATH}")
     print(f"{'═' * 60}\n")
 
-    sources_to_use = SOURCES
-    if args.source:
-        path = SOURCE_FILTER[args.source]
-        label = args.source
-        sources_to_use = [(path, label)]
+    sources_to_run = (
+        [SOURCES[SOURCE_FILTER[args.source]]] if args.source else SOURCES
+    )
 
     all_examples: list[dict] = []
-
-    for path_str, source_label in sources_to_use:
-        path = Path(path_str)
-        if not path.exists():
-            print(f"  [SKIP] {path_str} — not found (run source script first)")
-            continue
-
-        with open(path) as f:
-            raw = [json.loads(l) for l in f if l.strip()]
-
-        kept = skipped = truncated = 0
-        tokens_before: list[int] = []
-        tokens_after:  list[int] = []
-
-        for ex in raw:
-            tb = _count_example(ex)
-            tokens_before.append(tb)
-
-            result = truncate_example(ex, args.max_tokens)
-            if result is None:
-                skipped += 1
-                continue
-
-            ta = _count_example(result)
-            tokens_after.append(ta)
-            if ta < tb:
-                truncated += 1
-
-            all_examples.append(result)
-            kept += 1
-
-        print(f"  Source : {source_label}  ({path_str})")
-        print(f"    Raw examples : {len(raw)}")
-        print(f"    Kept         : {kept}")
-        print(f"    Truncated    : {truncated}  ({100*truncated/max(1,kept):.0f}%)")
-        print(f"    Skipped      : {skipped}")
-        if tokens_before:
-            print(f"    Tokens before: min={min(tokens_before)}  "
-                  f"median={statistics.median(tokens_before):.0f}  "
-                  f"max={max(tokens_before)}")
-        if tokens_after:
-            print(f"    Tokens after : min={min(tokens_after)}  "
-                  f"median={statistics.median(tokens_after):.0f}  "
-                  f"max={max(tokens_after)}")
-        print()
+    for raw_in, label, max_tok, proc_out in sources_to_run:
+        examples = process_source(raw_in, label, max_tok, proc_out, args.dry_run)
+        all_examples.extend(examples)
 
     if not all_examples:
         print("No examples loaded — nothing to write.")
         return
 
+    # If only one source was processed, skip combined output
+    if args.source:
+        print(f"  Single-source mode — skipping combined output.\n")
+        return
+
     random.shuffle(all_examples)
 
     all_tokens = [_count_example(e) for e in all_examples]
-    over_limit = sum(1 for t in all_tokens if t > args.max_tokens)
 
     from collections import Counter
     src_counts = Counter(e["metadata"].get("source", "unknown") for e in all_examples)
@@ -228,7 +256,6 @@ def main() -> None:
     print(f"{'─' * 60}")
     print(f"  Combined dataset")
     print(f"    Total examples : {len(all_examples)}")
-    print(f"    Over limit     : {over_limit}  (should be 0)")
     print(f"    Tokens — min={min(all_tokens)}  "
           f"median={statistics.median(all_tokens):.0f}  "
           f"max={max(all_tokens)}")

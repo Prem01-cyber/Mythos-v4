@@ -100,37 +100,47 @@ MODEL_MAP = {
 }
 MODEL_NAME = MODEL_MAP[args.model]
 
-# Source → (dataset file, output directory, recommended_epochs)
-# Small datasets (HTB/Vulhub/ATT&CK) need more epochs because the optimizer
-# sees far fewer total gradient steps. Rule of thumb: target ~400 total steps.
-# ExploitDB: 2143 ex / 16 eff_batch × 3 epochs = 402 steps ✓
-# HTB:        188 ex / 16 × 8 epochs  =  94 steps  (small, squeeze more passes)
-# Vulhub:     265 ex / 16 × 6 epochs  = 102 steps
-# ATT&CK:     295 ex / 16 × 6 epochs  = 114 steps
+# Source → (dataset file, output directory, recommended_epochs, max_seq_len)
+# All paths point to processed/ — run `python3 prepare_data.py` locally to generate them.
+#
+# Per-source max_seq_len tuned to actual token distributions (see inspect_tokens.py):
+#   exploitdb  2048  — max 2043, hard-capped single-turn
+#   htb        4096  — max 4062, long multi-turn pentest chains
+#   vulhub     3000  — 98.7% fit; 2 extreme outliers dropped at this limit
+#   attack     2048  — max 1174, compact ATT&CK technique scenarios
+#
+# Different max_seq_len per adapter is NOT an issue:
+#   Each adapter trains on a frozen base; seq_len only affects activation memory
+#   during that training run. Adapters are fully interoperable at inference time.
+#
+# Epoch targets — rule of thumb: ~400 total gradient steps
+#   ExploitDB: 2143 ex / 16 eff_batch × 3 epochs = 402 steps ✓
+#   HTB:        188 ex / 16 × 8 epochs  =  94 steps  (small — more passes needed)
+#   Vulhub:     153 ex / 16 × 6 epochs  =  57 steps
+#   ATT&CK:     337 ex / 16 × 6 epochs  = 126 steps
 SOURCE_MAP = {
-    "exploitdb": ("processed/exploitdb.jsonl",  "outputs/mythos-v4-exploitdb", 3),
-    "htb":       ("raw/htb_writeups.jsonl",      "outputs/mythos-v4-htb",       8),
-    "vulhub":    ("raw/vulhub.jsonl",            "outputs/mythos-v4-vulhub",    6),
-    "attack":    ("raw/attack.jsonl",            "outputs/mythos-v4-attack",    6),
-    "combined":  ("processed/combined.jsonl",    "outputs/mythos-v4-combined",  3),
+    # source   (data path,                        output dir,                  epochs, seq_len)
+    "exploitdb": ("processed/exploitdb.jsonl",    "outputs/mythos-v4-exploitdb", 3,   2048),
+    "htb":       ("processed/htb_writeups.jsonl", "outputs/mythos-v4-htb",       8,   4096),
+    "vulhub":    ("processed/vulhub.jsonl",        "outputs/mythos-v4-vulhub",    6,   3000),
+    "attack":    ("processed/attack.jsonl",        "outputs/mythos-v4-attack",    6,   2048),
+    "combined":  ("processed/combined.jsonl",      "outputs/mythos-v4-combined",  3,   3000),
 }
 
 # Resolve source: explicit --source wins; fall back to detecting from --data; else default
 if args.source:
-    _data_default, _out_default, _epoch_default = SOURCE_MAP[args.source]
+    _data_default, _out_default, _epoch_default, _seq_default = SOURCE_MAP[args.source]
 elif args.data:
     _data_default  = args.data
     _out_default   = "outputs/mythos-v4-custom"
     _epoch_default = 3
+    _seq_default   = 3000
 else:
     parser.error("Specify --source (exploitdb | htb | vulhub | attack | combined).")
 
 DATA_PATH   = args.data   or _data_default
 OUTPUT_DIR  = args.output or _out_default
 
-# Override epochs only if user didn't explicitly pass --epochs
-# argparse has no built-in "was this set by user" check, so we use a sentinel:
-# EPOCHS: auto-set from source map unless user explicitly passed --epochs
 if args.epochs is None:
     EPOCHS = _epoch_default
 else:
@@ -139,7 +149,7 @@ else:
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-MAX_SEQ_LEN   = 3000
+MAX_SEQ_LEN   = _seq_default   # per-source tuned value (see SOURCE_MAP comments)
 LORA_R        = 64
 LORA_ALPHA    = 128        # = 2 × r (standard scaling)
 LORA_DROPOUT  = 0          # 0 = full Unsloth patching on LoRA matrices (faster).
