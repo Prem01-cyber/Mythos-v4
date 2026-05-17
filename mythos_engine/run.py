@@ -40,7 +40,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
 
-    # ── Required ──────────────────────────────────────────────────────────────
+    # ── Target ────────────────────────────────────────────────────────────────
     p.add_argument("--target", "-t", required=False, default="",
                    help="Target IP / hostname / URL")
 
@@ -49,6 +49,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="No-GPU mode: return stub responses (for development / testing)")
     p.add_argument("--cli",  action="store_true",
                    help="Headless CLI mode (no TUI, prints to stdout)")
+
+    # ── Execution ─────────────────────────────────────────────────────────────
+    p.add_argument("--execute", action="store_true",
+                   help="Enable live command execution (model commands run via subprocess). "
+                        "Default: OFF (model advises only). "
+                        "CAUTION: Only use on authorised targets.")
+    p.add_argument("--execution-timeout", type=int, default=30, metavar="SECONDS",
+                   help="Timeout per command in seconds (default: 30)")
+
+    # ── Bug bounty ────────────────────────────────────────────────────────────
+    p.add_argument("--bug-bounty", action="store_true",
+                   help="Enable bug bounty mode (web app phases, scope enforcement, "
+                        "vulnerability report format instead of CTF flags)")
+    p.add_argument("--scope", metavar="SCOPE_FILE",
+                   help="Path to JSON scope file for bug bounty mode. "
+                        "See docs for format. If omitted, target domain is used as scope.")
+
+    # ── Metasploit ────────────────────────────────────────────────────────────
+    p.add_argument("--msf", action="store_true",
+                   help="Enable Metasploit RPC integration (requires msfrpcd running)")
+    p.add_argument("--msf-host", default="127.0.0.1")
+    p.add_argument("--msf-port", type=int, default=55553)
+    p.add_argument("--msf-password", default=None, metavar="PASS",
+                   help="Metasploit RPC password (can also be set via MSF_PASSWORD env var)")
 
     # ── Session ───────────────────────────────────────────────────────────────
     p.add_argument("--session", metavar="ID",
@@ -67,7 +91,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature",    type=float, default=0.3)
 
     # ── Misc ──────────────────────────────────────────────────────────────────
-    p.add_argument("--debug",    action="store_true", help="Enable verbose debug logging")
+    p.add_argument("--debug",     action="store_true", help="Enable verbose debug logging")
     p.add_argument("--no-splash", action="store_true", help="Skip splash screen")
 
     return p
@@ -75,6 +99,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _build_config(args: argparse.Namespace) -> "PentestGPTConfig":
     """Build PentestGPTConfig + MythosSettings from parsed args."""
+    import os as _os
     from pentestgpt.core.config import (
         AdapterConfig, DEFAULT_ADAPTERS, MythosSettings, PentestGPTConfig,
     )
@@ -94,14 +119,27 @@ def _build_config(args: argparse.Namespace) -> "PentestGPTConfig":
                 is_qwen3=adapters[name].is_qwen3, max_seq=adapters[name].max_seq,
             )
         else:
-            # Unknown adapter — assume Qwen3 base
             adapters[name] = AdapterConfig(path=path, base="Qwen/Qwen3-14B", is_qwen3=True)
+
+    # Metasploit password: arg > env var
+    msf_pass = getattr(args, "msf_password", None) or _os.environ.get("MSF_PASSWORD")
 
     mythos = MythosSettings(
         adapters=adapters,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         mock=args.mock,
+        # Execution
+        allow_execution=getattr(args, "execute", False),
+        execution_timeout=getattr(args, "execution_timeout", 30),
+        # Metasploit
+        msf_enabled=getattr(args, "msf", False),
+        msf_host=getattr(args, "msf_host", "127.0.0.1"),
+        msf_port=getattr(args, "msf_port", 55553),
+        msf_password=msf_pass,
+        # Bug bounty
+        bug_bounty=getattr(args, "bug_bounty", False),
+        scope_file=getattr(args, "scope", None),
     )
 
     return PentestGPTConfig(
@@ -156,6 +194,11 @@ async def _run_cli(args: argparse.Namespace, config: "PentestGPTConfig") -> None
     console.print(f"[bold #f59e0b]⚡ Mythos Engine[/] [dim]—[/] target: [bold]{config.target}[/]")
     if args.mock:
         console.print("[yellow]Mock mode (no GPU)[/]")
+    if getattr(args, "execute", False):
+        console.print("[bold red]EXECUTION ENABLED — commands will run live[/]")
+    if getattr(args, "bug_bounty", False):
+        scope_info = f" (scope: {args.scope})" if getattr(args, "scope", None) else ""
+        console.print(f"[cyan]Bug bounty mode{scope_info}[/]")
     console.print()
 
     backend = _build_backend(config, mock=args.mock)
