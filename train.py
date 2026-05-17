@@ -367,7 +367,7 @@ trainer_stats = trainer.train()
 # ---------------------------------------------------------------------------
 # Save final adapter
 # ---------------------------------------------------------------------------
-adapter_path = os.path.join(args.output, "final-adapter")
+adapter_path = os.path.join(OUTPUT_DIR, "final-adapter")
 model.save_pretrained(adapter_path)
 tokenizer.save_pretrained(adapter_path)
 print(f"\nAdapter saved to: {adapter_path}")
@@ -390,6 +390,6 @@ print(f"{'═'*60}\n")
 # Optional: merge adapter into base for single-file deployment
 # ---------------------------------------------------------------------------
 print("Merging adapter into base weights (for single-file deployment)...")
-merged_path = os.path.join(args.output, "merged-bf16")
+merged_path = os.path.join(OUTPUT_DIR, "merged-bf16")
 model.save_pretrained_merged(merged_path, tokenizer, save_method="merged_16bit")
 print(f"Merged model saved to: {merged_path}")
