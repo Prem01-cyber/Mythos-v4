@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Mythos-v4 Fine-tuning Script
-Model  : Qwen/Qwen2.5-Coder-14B-Instruct
+Model  : Qwen/Qwen3-14B (default — recommended)
 Stack  : Unsloth + Flash Attention 2 + TRL SFTTrainer
 Target : A100 SXM 80 GB
 
@@ -9,28 +9,34 @@ No quantization — full BF16 weights + LoRA adapters.
 Flash Attention is mathematically identical to standard attention;
 no precision loss, just memory efficiency and ~2x speed.
 
-Dataset (combined):
-  processed/exploitdb.jsonl   Source 1 — exploit code + reasoning (2143 examples)
-  raw/htb_writeups.jsonl      Source 2 — HTB multi-turn methodology (174 examples)
-  → combined into processed/combined.jsonl by prepare_data.py
+Model Selection:
+  q3-8b   → Qwen3-8B,   18 GB BF16, single A100, fastest training
+  q3-14b  → Qwen3-14B,  30 GB BF16, single A100, best 1-GPU choice ★
+  q3-32b  → Qwen3-32B,  65 GB BF16, needs 2×A100 or --qlora
+  Qwen3 has significantly better reasoning than Qwen2.5-Coder at the same size.
+  Community consensus (2026): "Qwen2.5-Coder 32B is ancient vs Qwen3."
+  The reasoning advantage is critical for <thought> quality and exploit chains.
 
 Architecture: Specialized LoRA Adapters (one per source)
   Each adapter is trained independently from the same frozen base model.
-  This eliminates catastrophic forgetting entirely — base weights never change.
+  This eliminates catastrophic forgetting — base weights never change.
   Adapters are swapped at inference time based on task type:
     • Adapter 1 (exploitdb)   → exploit code generation, CVE analysis
     • Adapter 2 (htb)         → multi-turn pentest methodology, HTB chains
-    • Adapter N (future)      → additional specializations (Source 3, 4, ...)
+    • Adapter 3 (vulhub)      → CVE exploitation, RCE/SSRF/SSTI chains
+    • Adapter 4 (attack)      → ATT&CK red team techniques
 
   --source flag selects which dataset this adapter trains on.
   Output path automatically namespaced: outputs/mythos-v4-{source}/
 
 Usage:
-    python3 train.py --source exploitdb     # Adapter 1 — exploit code
-    python3 train.py --source htb           # Adapter 2 — pentest methodology
-    python3 train.py --source combined      # combined (for ablation comparison)
-    python3 train.py --model 7b --source htb
-    python3 train.py --epochs 5 --source exploitdb
+    python3 train.py --source exploitdb              # Adapter 1 — exploit code
+    python3 train.py --source htb                    # Adapter 2 — pentest methodology
+    python3 train.py --source vulhub                 # Adapter 3 — CVE exploitation
+    python3 train.py --source attack                 # Adapter 4 — ATT&CK techniques
+    python3 train.py --source combined               # all sources merged (ablation only)
+    python3 train.py --model q3-8b --source exploitdb   # fast 8B training
+    python3 train.py --model q3-32b --qlora --source htb  # 32B on single A100
 """
 
 import os
@@ -46,10 +52,12 @@ from collections import Counter
 # Args — parse before any heavy imports so --help is instant
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
-parser.add_argument("--model",   default="14b",
-                    choices=["7b", "14b", "32b"],
-                    help="Model size: 7b/14b → single A100 80GB BF16; "
-                         "32b → 2×A100 80GB BF16 or add --qlora for single A100")
+parser.add_argument("--model",   default="q3-14b",
+                        choices=["q3-8b", "q3-14b", "q3-32b", "7b", "14b", "32b"],
+                        help="Model: q3-14b (default, recommended) → Qwen3-14B 30GB BF16 on single A100; "
+                             "q3-8b → Qwen3-8B 18GB, fastest; "
+                             "q3-32b → Qwen3-32B 65GB, needs 2×A100 or --qlora; "
+                             "7b/14b/32b = legacy Qwen2.5-Coder variants")
 parser.add_argument("--source",  default=None,
                     choices=["exploitdb", "htb", "vulhub", "attack", "combined"],
                     help="Which dataset to train on. "
@@ -76,9 +84,19 @@ args = parser.parse_args()
 random.seed(args.seed)
 
 MODEL_MAP = {
+    # ── Qwen3 (recommended) ────────────────────────────────────────────
+    # Qwen3 has significantly better reasoning than Qwen2.5-Coder at the same
+    # size. Critical for exploit analysis, `<thought>` quality, multi-step chains.
+    # Community: "Qwen2.5-Coder 32B is ancient/outdated vs Qwen3" (2026).
+    "q3-8b":  "Qwen/Qwen3-8B",          #  18 GB BF16 — fits any A100, fast training
+    "q3-14b": "Qwen/Qwen3-14B",         #  30 GB BF16 — fits A100 80GB, best 1-GPU choice ★
+    "q3-32b": "Qwen/Qwen3-32B",         #  65 GB BF16 — needs 2×A100 or --qlora on 1×A100
+
+    # ── Qwen2.5-Coder (legacy, kept for continuity) ────────────────────
+    # Use only if re-running a previously started Source 1 adapter.
     "7b":  "Qwen/Qwen2.5-Coder-7B-Instruct",
     "14b": "Qwen/Qwen2.5-Coder-14B-Instruct",
-    "32b": "Qwen/Qwen2.5-Coder-32B-Instruct",  # ~64GB BF16 — needs 2×A100 or QLoRA on 1×A100
+    "32b": "Qwen/Qwen2.5-Coder-32B-Instruct",
 }
 MODEL_NAME = MODEL_MAP[args.model]
 
