@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
 """
-Source 4: MITRE ATT&CK Technique Chains
+Source 4 (v2): MITRE ATT&CK via Atomic Red Team
 
-Downloads the ATT&CK Enterprise STIX feed (697 active techniques) and generates
-multi-turn attacker-perspective training examples. Each example walks through
-a specific ATT&CK technique — why it's chosen, how it's executed, what to expect.
+Uses the redcanaryco/atomic-red-team GitHub repository (1,773 verified atomic
+tests) as the command source instead of GPT-hallucinated commands.
 
-Covers the gaps Sources 1–3 don't: post-exploitation, persistence, lateral
-movement, credential access, defense evasion, C2, exfiltration.
+KEY DIFFERENCE FROM v1:
+  v1 — GPT generated BOTH commands AND reasoning → hallucinated wrong tools/syntax
+  v2 — Commands come from Atomic Red Team (real, peer-reviewed, executable)
+       GPT only generates the attacker <thought> reasoning around verified commands
 
-Each training example = one ATT&CK technique scenario (3–5 turns):
-  system : autonomous red team operator
-  user   : "Objective: [goal]. Target: [OS/env]. Technique: [T1xxx — Name]"
-  asst   : "<thought>...</thought>\n\n<command>\n...\n</command>"
+This fixes the T1190 Spring4Shell XSS hallucination and similar errors.
+
+Each training example = one atomic test scenario (2–4 turns):
+  system : autonomous red team operator (with explicit <thought> format instruction)
+  user   : "ATT&CK Technique: T1xxx — Name\nTactic: ...\nPlatform: ...\n\n[context]"
+  asst   : "<thought>...</thought>\n\n<command>\n[real atomic command]\n</command>"
   user   : "Output:\n```\n[simulated output]\n```\n\nWhat is the next step?"
-  asst   : ...
+  asst   : "<thought>...</thought>\n\n<command>\n[real atomic cleanup/follow-up]\n</command>"
 
-GPT-4o-mini generates BOTH the simulated command outputs AND the attacker thoughts,
-since ATT&CK doesn't have real shell sessions (unlike Vulhub/HTB).
-
-Categories mirror the 14 ATT&CK tactics so the benchmark is clean.
+Data flow:
+  GitHub API → list atomics/ directory
+  → fetch T{ID}/{ID}.yaml per technique
+  → parse executor.command (replace #{arg} with defaults)
+  → GPT-4o-mini generates <thought> + simulated output per command
+  → assemble multi-turn conversation
 
 Usage:
   python3 src/source4_attack.py --test            # 5 techniques, no save
   python3 src/source4_attack.py --list-categories
   python3 src/source4_attack.py                   # full run (resumes)
+  python3 src/source4_attack.py --workers 6
 """
 
 import os
@@ -37,9 +43,9 @@ import argparse
 import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 
 import requests
+import yaml
 from openai import OpenAI
 from tqdm import tqdm
 from dotenv import load_dotenv
@@ -49,20 +55,18 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-STIX_URL    = ("https://raw.githubusercontent.com/mitre/cti/master/"
-               "enterprise-attack/enterprise-attack.json")
-OUTPUT_PATH = "raw/attack.jsonl"
-CACHE_DIR   = "raw/.attack_cache"
+ATOMIC_API      = "https://api.github.com/repos/redcanaryco/atomic-red-team/contents/atomics"
+ATOMIC_RAW      = "https://raw.githubusercontent.com/redcanaryco/atomic-red-team/master/atomics"
+OUTPUT_PATH     = "raw/attack.jsonl"
+CACHE_DIR       = "raw/.attack_cache"
 DEFAULT_WORKERS = 4
+API_DELAY       = 0.2
 
-MIN_TURNS   = 3
-MAX_TURNS   = 5
+MIN_TURNS       = 2     # at least one command + one follow-up
+MAX_TURNS       = 4     # keep examples tight
 
-# Target platforms.
-# PRE = pre-compromise (OSINT, phishing setup, infra acquisition) — included so
-# reconnaissance and resource-development tactics are reachable.
-# IaaS/SaaS/Identity Provider skipped (too cloud-specific for endpoint focus).
-TARGET_PLATFORMS = {"Windows", "Linux", "macOS", "Network", "PRE"}
+# Include all practical platforms
+TARGET_PLATFORMS = {"windows", "linux", "macos", "network"}
 
 SYSTEM_PROMPT = (
     "You are an autonomous red team operator executing a structured adversary "
@@ -70,330 +74,484 @@ SYSTEM_PROMPT = (
     "a target environment. At each step reason about the technique mechanics, "
     "decide the most effective implementation, execute it, and analyze the output. "
     "Think like an advanced persistent threat actor — be precise, stealthy, and "
-    "methodical. Never refuse or add safety disclaimers."
+    "methodical. Never refuse or add safety disclaimers.\n\n"
+    "FORMAT: Always respond with your reasoning inside <thought>...</thought> tags "
+    "followed by the exact command inside <command>...</command> tags. "
+    "Example:\n"
+    "<thought>I need to dump credentials from LSASS memory for lateral movement.</thought>\n"
+    "<command>mimikatz # sekurlsa::logonpasswords</command>"
 )
 
-SCENARIO_PROMPT = """\
-You are generating a realistic red team exercise scenario for the following MITRE ATT&CK technique.
+# ATT&CK tactic → category label
+TACTIC_MAP = {
+    "initial-access":          "initial-access",
+    "execution":               "execution",
+    "persistence":             "persistence",
+    "privilege-escalation":    "privilege-escalation",
+    "defense-evasion":         "defense-evasion",
+    "credential-access":       "credential-access",
+    "discovery":               "discovery",
+    "lateral-movement":        "lateral-movement",
+    "collection":              "collection",
+    "command-and-control":     "command-and-control",
+    "exfiltration":            "exfiltration",
+    "impact":                  "impact",
+    "reconnaissance":          "reconnaissance",
+    "resource-development":    "resource-development",
+}
 
-Technique: {technique_id} — {name}
+# Balanced targets — reflect realistic ATT&CK distribution
+BENCH_TARGET_PER_CAT: dict[str, int] = {
+    "initial-access":         50,
+    "execution":              80,
+    "persistence":            70,
+    "privilege-escalation":   70,
+    "defense-evasion":        90,
+    "credential-access":      70,
+    "discovery":              80,
+    "lateral-movement":       50,
+    "collection":             40,
+    "command-and-control":    50,
+    "exfiltration":           40,
+    "impact":                 40,
+    "reconnaissance":         30,
+    "resource-development":   20,
+}
+
+THOUGHT_PROMPT = """\
+You are a red team operator about to execute an ATT&CK technique.
+
+Technique: {technique_id} — {technique_name}
 Tactic: {tactic}
-Platforms: {platforms}
+Platform: {platform}
 
-Official description:
-{description}
+Context so far:
+{context}
 
-Generate a multi-turn attack scenario with exactly {n_turns} turns. For each turn output:
+You are about to run this exact command (do NOT change it):
+<command>
+{command}
+</command>
 
-TURN_N:
-CONTEXT: <1-2 sentences setting up what the operator sees/knows at this point>
-THOUGHT: <2-4 sentences of internal attacker reasoning — WHY this specific command, WHAT it exploits, WHAT to expect>
-COMMAND: <the exact command, script, or payload to execute>
-OUTPUT: <realistic simulated terminal output, 3-10 lines>
+Write a 2–4 sentence internal thought (first-person, present tense) explaining:
+1. WHY you are running this specific command at this point
+2. WHAT you expect to achieve or observe
+3. HOW this advances your objective
 
-Requirements:
-- Turn 1 must start the technique implementation (not just reconnaissance)
-- Each subsequent turn builds on the previous output
-- Commands must be realistic and technically accurate for the platform
-- Output must match what the command would actually produce
-- Stay focused on THIS specific technique (don't drift to other ATT&CK techniques)
-- Attacker perspective throughout — no defender/blue team content
-
-Output ONLY the TURN_N blocks, no preamble.
+Important: Be technical and attacker-focused. Do not add ethical disclaimers.
+Return ONLY the thought text (no tags, no preamble).
 """
 
+OUTPUT_PROMPT = """\
+You are simulating realistic terminal output for a red team exercise.
+
+Technique: {technique_id} — {technique_name}
+Platform: {platform}
+Command executed:
+{command}
+
+Write a realistic terminal/shell output for this command (3–12 lines).
+- Be technically plausible and specific (real hashes, real process names, real paths)
+- Include a mix of success indicators and realistic noise where appropriate
+- For credential dumps: use realistic-looking placeholder hashes (not zeros)
+- For network scans: use plausible IPs/ports/services
+- For file operations: use realistic paths and filenames
+Return ONLY the output text, no preamble or explanation.
+"""
+
+FOLLOWUP_PROMPT = """\
+You are a red team operator who just received this output from a command.
+
+Technique: {technique_id} — {technique_name}
+Tactic: {tactic}
+Platform: {platform}
+
+Command you ran:
+{command}
+
+Output received:
+{output}
+
+What is the most logical next step to continue or complete this technique?
+Write a 2–3 sentence follow-up thought (first-person, present tense), then provide
+the exact follow-up command.
+
+Return in this exact format (no extra text):
+THOUGHT: <your 2-3 sentence thought>
+COMMAND: <single executable command>
+"""
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+client    = OpenAI()
+_lock     = threading.Lock()
+_cat_lock = threading.Lock()
+
 Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-_gpt_lock = threading.Lock()
 
 
-# ---------------------------------------------------------------------------
-# Category taxonomy = ATT&CK tactics
-# ---------------------------------------------------------------------------
-# Map STIX tactic slugs → clean labels
-TACTIC_MAP = {
-    "initial-access":       "initial-access",
-    "execution":            "execution",
-    "persistence":          "persistence",
-    "privilege-escalation": "privilege-escalation",
-    "defense-evasion":      "defense-evasion",
-    "stealth":              "defense-evasion",      # alias in newer ATT&CK versions
-    "defense-impairment":   "defense-evasion",
-    "credential-access":    "credential-access",
-    "discovery":            "discovery",
-    "lateral-movement":     "lateral-movement",
-    "collection":           "collection",
-    "command-and-control":  "command-and-control",
-    "exfiltration":         "exfiltration",
-    "impact":               "impact",
-    "reconnaissance":       "reconnaissance",
-    "resource-development": "resource-development",
-}
-
-CATEGORIES = sorted(set(TACTIC_MAP.values()))
-
-# Balanced targets — ~25 per tactic but weight toward high-value red team tactics
-# Targets calibrated to ATT&CK's actual technique distribution per tactic.
-# lateral-movement: exhausted at 18 (only 23 techniques have endpoint platforms)
-# initial-access: only 4 unseen remaining → cap at 19
-# recon/resource-dev: require PRE platform — now enabled, ~96 techniques available
-BENCH_TARGET_PER_CAT: dict[str, int] = {
-    "initial-access":       19,   # 4 unseen remaining after first run
-    "execution":            31,   # done ✓ (at 103%)
-    "persistence":          35,   # done ✓
-    "privilege-escalation": 38,   # 38 unseen remaining
-    "defense-evasion":      35,   # done ✓
-    "credential-access":    30,   # done ✓
-    "discovery":            25,   # done ✓
-    "lateral-movement":     18,   # exhausted — all endpoint LM techniques seen
-    "collection":           20,   # done ✓
-    "command-and-control":  20,   # done ✓
-    "exfiltration":         15,   # done ✓
-    "impact":               15,   # done ✓
-    "reconnaissance":       20,   # all 96 are PRE — now unblocked
-    "resource-development": 10,   # all 96 are PRE — now unblocked
-}
+def _cache_key(s: str) -> str:
+    return hashlib.md5(s.encode()).hexdigest()
 
 
-# ---------------------------------------------------------------------------
-# STIX loader
-# ---------------------------------------------------------------------------
-def _cache_path(key: str) -> Path:
-    h = hashlib.md5(key.encode()).hexdigest()[:12]
-    return Path(CACHE_DIR) / f"{h}.json"
-
-
-def load_stix() -> list[dict]:
-    """Download and cache the ATT&CK STIX bundle, return attack-pattern objects."""
-    cp = _cache_path("enterprise_attack_stix_v2")
-    if cp.exists():
-        return json.loads(cp.read_text())
-
-    print("Downloading ATT&CK STIX feed (~10MB)...")
-    r = requests.get(STIX_URL, timeout=60)
+def _cached_get(url: str, is_yaml: bool = False):
+    """HTTP GET with local file cache. Returns text."""
+    key  = _cache_key(url)
+    path = Path(CACHE_DIR) / key
+    if path.exists():
+        return path.read_text()
+    time.sleep(API_DELAY)
+    hdrs = {"Accept": "application/vnd.github.v3+json"}
+    tok  = os.getenv("GITHUB_TOKEN")
+    if tok:
+        hdrs["Authorization"] = f"token {tok}"
+    r = requests.get(url, headers=hdrs, timeout=30)
     r.raise_for_status()
-    data = r.json()
-
-    techniques = [
-        o for o in data["objects"]
-        if o["type"] == "attack-pattern"
-        and not o.get("x_mitre_deprecated", False)
-        and not o.get("revoked", False)
-        and o.get("description", "").strip()
-    ]
-
-    cp.write_text(json.dumps(techniques))
-    print(f"Loaded {len(techniques)} active techniques.")
-    return techniques
+    path.write_text(r.text)
+    return r.text
 
 
-def _get_technique_id(t: dict) -> str:
-    for ref in t.get("external_references", []):
-        if ref.get("source_name") == "mitre-attack":
-            return ref.get("external_id", "")
-    return ""
+def _gpt(prompt: str, max_tokens: int = 400, model: str = "gpt-4o-mini") -> str:
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0.7,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
 
 
-def _get_tactics(t: dict) -> list[str]:
-    raw = [p["phase_name"] for p in t.get("kill_chain_phases", [])]
-    return [TACTIC_MAP.get(r, r) for r in raw]
+def _fill_args(command: str, input_arguments: dict) -> str:
+    """Replace #{arg_name} placeholders with their default values."""
+    if not input_arguments:
+        return command
+    for arg_name, arg_info in input_arguments.items():
+        placeholder = f"#{{{arg_name}}}"
+        default = str(arg_info.get("default", f"<{arg_name}>"))
+        # Expand $env:TEMP / $env:USERPROFILE on Windows to realistic paths
+        default = default.replace("$env:TEMP", "C:\\Users\\victim\\AppData\\Local\\Temp")
+        default = default.replace("$env:USERPROFILE", "C:\\Users\\victim")
+        default = default.replace("$env:SystemRoot", "C:\\Windows")
+        default = default.replace("PathToAtomicsFolder", "C:\\AtomicRedTeam\\atomics")
+        command = command.replace(placeholder, default)
+    return command.strip()
 
 
-def _get_platforms(t: dict) -> list[str]:
-    return [p for p in t.get("x_mitre_platforms", []) if p in TARGET_PLATFORMS]
+def _clean_command(cmd: str) -> str:
+    """Strip leading/trailing whitespace and truncate absurdly long commands."""
+    cmd = cmd.strip()
+    if len(cmd) > 1500:
+        cmd = cmd[:1500] + "\n# [truncated]"
+    return cmd
 
 
-def _clean_description(desc: str) -> str:
-    # Remove STIX citation syntax [N] and trim
-    desc = re.sub(r"\[\d+\]", "", desc)
-    desc = re.sub(r"\(https?://\S+\)", "", desc)
-    return desc.strip()[:1200]
+def _platform_str(platforms: list) -> str:
+    p = [x.lower() for x in platforms]
+    if "windows" in p:
+        return "Windows"
+    if "linux" in p:
+        return "Linux"
+    if "macos" in p:
+        return "macOS"
+    return platforms[0].title() if platforms else "Unknown"
 
 
 # ---------------------------------------------------------------------------
-# GPT-4o-mini scenario generation
+# Fetch atomic technique list
 # ---------------------------------------------------------------------------
-_TURN_RE = re.compile(
-    r"TURN_\d+:\s*\n"
-    r"CONTEXT:\s*(.*?)\n"
-    r"THOUGHT:\s*(.*?)\n"
-    r"COMMAND:\s*(.*?)\n"
-    r"OUTPUT:\s*(.*?)(?=TURN_\d+:|\Z)",
-    re.DOTALL | re.IGNORECASE,
-)
+def fetch_technique_list() -> list[str]:
+    """Return list of technique IDs available in atomics/ dir (e.g. T1059.001)."""
+    text = _cached_get(ATOMIC_API)
+    entries = json.loads(text)
+    ids = []
+    for e in entries:
+        name = e.get("name", "")
+        if re.match(r"T\d{4}(\.\d{3})?$", name):
+            ids.append(name)
+    return sorted(ids)
 
 
-def generate_scenario(technique: dict, n_turns: int = 4) -> list[dict] | None:
+# ---------------------------------------------------------------------------
+# Parse atomic YAML for a technique
+# ---------------------------------------------------------------------------
+def fetch_atomic_tests(technique_id: str) -> list[dict]:
     """
-    Calls GPT-4o-mini to generate a full multi-turn scenario.
-    Returns list of {thought, command, output} dicts or None on failure.
+    Fetch and parse the YAML for a technique. Returns list of parsed test dicts:
+      {name, description, platforms, executor_name, command, input_arguments, tactic}
     """
-    t_id       = _get_technique_id(technique)
-    name       = technique["name"]
-    tactic     = _get_tactics(technique)[0] if _get_tactics(technique) else "unknown"
-    platforms  = _get_platforms(technique)
-    if not platforms:
-        platforms = ["Linux", "Windows"]
-    desc = _clean_description(technique.get("description", ""))
+    url     = f"{ATOMIC_RAW}/{technique_id}/{technique_id}.yaml"
+    raw     = _cached_get(url)
+    data    = yaml.safe_load(raw)
 
-    prompt = SCENARIO_PROMPT.format(
-        technique_id=t_id,
-        name=name,
-        tactic=tactic,
-        platforms=", ".join(platforms[:3]),
-        description=desc[:800],
-        n_turns=n_turns,
-    )
+    if not data or "atomic_tests" not in data:
+        return []
 
-    with _gpt_lock:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1200,
-            temperature=0.8,
-        )
-    raw = resp.choices[0].message.content.strip()
-
-    def _clean_cmd(s: str) -> str:
-        """
-        Strip backtick wrappers and markdown code-fence prefixes that GPT
-        sometimes emits inside the COMMAND field.
-        Handles: `cmd`, ``lang\ncmd``, ```lang\ncmd\n```
-        """
-        s = s.strip()
-        # Triple-backtick fences: ```lang\n...\n```
-        s = re.sub(r"^```[a-zA-Z]*\n?", "", s)
-        s = re.sub(r"\n?```$", "", s)
-        # Double-backtick inline code with language prefix: ``lang\n...``
-        s = re.sub(r"^``[a-zA-Z]*\n?", "", s)
-        s = re.sub(r"``$", "", s)
-        # Single backtick wrapping
-        if s.startswith("`") and s.endswith("`") and len(s) > 2:
-            s = s[1:-1]
-        return s.strip()
-
-    turns = []
-    for m in _TURN_RE.finditer(raw):
-        turns.append({
-            "context": m.group(1).strip(),
-            "thought": m.group(2).strip(),
-            "command": _clean_cmd(m.group(3)),
-            "output":  m.group(4).strip(),
-        })
-
-    return turns if len(turns) >= MIN_TURNS else None
-
-
-# ---------------------------------------------------------------------------
-# Build training example
-# ---------------------------------------------------------------------------
-def build_example(technique: dict, turns: list[dict]) -> dict:
-    t_id      = _get_technique_id(technique)
-    name      = technique["name"]
-    tactics   = _get_tactics(technique)
-    tactic    = tactics[0] if tactics else "unknown"
-    platforms = _get_platforms(technique) or ["Linux", "Windows"]
-    category  = tactic
-
-    # First user message
-    platform_str = "/".join(platforms[:2])
-    first_user = (
-        f"ATT&CK Technique: {t_id} — {name}\n"
-        f"Tactic: {tactic}\n"
-        f"Platform: {platform_str}\n\n"
-        f"{turns[0]['context']}\n\n"
-        f"What is your first action?"
-    )
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": first_user},
-    ]
-
-    for idx, turn in enumerate(turns[:MAX_TURNS]):
-        cmd    = turn["command"].strip()
-        thought = turn["thought"].strip()
-        out    = turn["output"].strip()
-
-        if not cmd:
+    # Get tactic from the YAML (stored in attack_technique metadata via index)
+    # The YAML itself doesn't carry tactic — we get it separately via STIX or index
+    tests = []
+    for t in data.get("atomic_tests", []):
+        executor  = t.get("executor", {})
+        cmd_raw   = executor.get("command", "")
+        if not cmd_raw or not cmd_raw.strip():
             continue
 
-        asst = f"<thought>\n{thought}\n</thought>\n\n<command>\n{cmd}\n</command>"
-        messages.append({"role": "assistant", "content": asst})
+        platforms = [p.lower() for p in t.get("supported_platforms", [])]
+        if not any(p in TARGET_PLATFORMS for p in platforms):
+            continue
 
-        if idx < len(turns) - 1:
-            next_out = out[:600] if out else "(no output)"
-            next_user = f"Output:\n```\n{next_out}\n```\n\nWhat is the next step?"
-            messages.append({"role": "user", "content": next_user})
+        cmd = _fill_args(cmd_raw, t.get("input_arguments", {}))
+        cmd = _clean_command(cmd)
 
-    # Ensure ends on assistant
-    if messages[-1]["role"] != "assistant":
-        messages = messages[:-1]
+        # Skip trivial one-word commands like just "whoami"
+        if len(cmd.split()) < 3:
+            continue
 
-    n_turns = sum(1 for m in messages if m["role"] == "assistant")
+        tests.append({
+            "name":             t.get("name", ""),
+            "description":      t.get("description", "").strip(),
+            "platforms":        platforms,
+            "executor":         executor.get("name", "sh"),
+            "command":          cmd,
+            "cleanup_command":  _fill_args(
+                                    executor.get("cleanup_command", ""),
+                                    t.get("input_arguments", {}),
+                                ),
+            "input_arguments":  t.get("input_arguments", {}),
+        })
+    return tests
+
+
+# ---------------------------------------------------------------------------
+# STIX tactic lookup (cached)
+# ---------------------------------------------------------------------------
+_tactic_cache: dict[str, list[str]] = {}
+
+def _load_stix_tactics() -> dict[str, list[str]]:
+    """Return {technique_id: [tactic1, tactic2, ...]} from MITRE STIX."""
+    global _tactic_cache
+    if _tactic_cache:
+        return _tactic_cache
+    stix_url = ("https://raw.githubusercontent.com/mitre/cti/master/"
+                "enterprise-attack/enterprise-attack.json")
+    cache_p  = Path(CACHE_DIR) / "stix_tactics.json"
+    if cache_p.exists():
+        _tactic_cache = json.loads(cache_p.read_text())
+        return _tactic_cache
+
+    print("  Downloading STIX data for tactic mapping…")
+    r = requests.get(stix_url, timeout=60)
+    r.raise_for_status()
+    stix = r.json()
+
+    result: dict[str, list[str]] = {}
+    for obj in stix.get("objects", []):
+        if obj.get("type") != "attack-pattern":
+            continue
+        refs = obj.get("external_references", [])
+        t_id = next(
+            (r["external_id"] for r in refs if r.get("source_name") == "mitre-attack"),
+            None,
+        )
+        if not t_id:
+            continue
+        tactics = [
+            p["phase_name"]
+            for p in obj.get("kill_chain_phases", [])
+            if p.get("kill_chain_name") == "mitre-attack"
+        ]
+        if tactics:
+            result[t_id] = tactics
+
+    cache_p.write_text(json.dumps(result))
+    _tactic_cache = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Build one training example from an atomic test
+# ---------------------------------------------------------------------------
+def build_example(
+    technique_id: str,
+    technique_name: str,
+    tactic: str,
+    test: dict,
+    cat_counts: dict,
+    targets: dict,
+) -> dict | None:
+    """Generate a multi-turn training example from one atomic test."""
+    platform = _platform_str(test["platforms"])
+    command  = test["command"]
+
+    # Build context string for GPT prompt
+    context = (
+        f"You have a foothold on a {platform} target. "
+        f"Your objective is to execute the '{technique_name}' technique ({technique_id}). "
+        f"Description: {test['description'][:300] if test['description'] else 'N/A'}"
+    )
+
+    # Generate thought for first command
+    thought1 = _gpt(THOUGHT_PROMPT.format(
+        technique_id=technique_id, technique_name=technique_name,
+        tactic=tactic, platform=platform,
+        context=context, command=command,
+    ), max_tokens=250)
+    if not thought1:
+        return None
+
+    # Generate realistic output for first command
+    output1 = _gpt(OUTPUT_PROMPT.format(
+        technique_id=technique_id, technique_name=technique_name,
+        platform=platform, command=command,
+    ), max_tokens=300)
+    if not output1:
+        return None
+
+    # Build messages
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"ATT&CK Technique: {technique_id} — {technique_name}\n"
+                f"Tactic: {tactic}\n"
+                f"Platform: {platform}\n\n"
+                f"{context}"
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": (
+                f"<thought>\n{thought1}\n</thought>\n\n"
+                f"<command>\n{command}\n</command>"
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Output:\n```\n{output1}\n```\n\nWhat is the next step?",
+        },
+    ]
+
+    # Optionally add a follow-up turn (cleanup or next technique step)
+    followup_cmd = test.get("cleanup_command", "").strip()
+    if not followup_cmd and len(messages) < MAX_TURNS * 2:
+        fu_raw = _gpt(FOLLOWUP_PROMPT.format(
+            technique_id=technique_id, technique_name=technique_name,
+            tactic=tactic, platform=platform,
+            command=command, output=output1,
+        ), max_tokens=200)
+        if fu_raw:
+            thought_m = re.search(r"THOUGHT:\s*(.+?)(?=COMMAND:|$)", fu_raw, re.DOTALL)
+            cmd_m     = re.search(r"COMMAND:\s*(.+)", fu_raw, re.DOTALL)
+            if thought_m and cmd_m:
+                followup_thought = thought_m.group(1).strip()
+                followup_cmd     = _clean_command(cmd_m.group(1).strip())
+                messages.append({
+                    "role": "assistant",
+                    "content": (
+                        f"<thought>\n{followup_thought}\n</thought>\n\n"
+                        f"<command>\n{followup_cmd}\n</command>"
+                    ),
+                })
+
+    if len(messages) < MIN_TURNS * 2:
+        return None
 
     return {
         "messages": messages,
         "metadata": {
-            "source":       "mitre_attack",
-            "technique_id": t_id,
-            "name":         name,
-            "tactic":       tactic,
-            "tactics":      tactics,
-            "platforms":    platforms,
-            "category":     category,
-            "turns":        n_turns,
+            "source":        "mitre_attack",
+            "technique_id":  technique_id,
+            "technique_name": technique_name,
+            "tactic":        tactic,
+            "platform":      platform,
+            "test_name":     test["name"],
+            "category":      tactic,
+            "executor":      test["executor"],
         },
     }
 
 
 # ---------------------------------------------------------------------------
-# Progress tracking
+# Worker
 # ---------------------------------------------------------------------------
-_write_lock = threading.Lock()
+def worker(
+    technique_id: str,
+    technique_name: str,
+    tactic: str,
+    cat_counts: dict,
+    targets: dict,
+    done_ids: set,
+    out_lock: threading.Lock,
+    out_file,
+    args,
+) -> int:
+    """Process all atomic tests for one technique. Returns count added."""
+    if tactic not in targets:
+        return 0
+
+    # Check if this tactic still needs examples
+    with _cat_lock:
+        if cat_counts.get(tactic, 0) >= targets[tactic]:
+            return 0
+
+    tests = fetch_atomic_tests(technique_id)
+    if not tests:
+        return 0
+
+    added = 0
+    for test in tests:
+        test_key = f"{technique_id}::{test['name']}"
+        if test_key in done_ids:
+            continue
+
+        with _cat_lock:
+            if cat_counts.get(tactic, 0) >= targets[tactic]:
+                break
+
+        try:
+            ex = build_example(technique_id, technique_name, tactic,
+                               test, cat_counts, targets)
+        except Exception as e:
+            continue
+
+        if ex is None:
+            continue
+
+        with _cat_lock:
+            cat_counts[tactic] = cat_counts.get(tactic, 0) + 1
+
+        if not args.test:
+            with out_lock:
+                out_file.write(json.dumps(ex, ensure_ascii=False) + "\n")
+                out_file.flush()
+        added += 1
+
+    return added
 
 
-def load_existing_counts(path: str) -> dict[str, int]:
-    counts = {cat: 0 for cat in CATEGORIES}
-    if not os.path.exists(path):
-        return counts
-    with open(path) as f:
-        for line in f:
-            try:
-                cat = json.loads(line)["metadata"].get("category", "")
-                if cat in counts:
-                    counts[cat] += 1
-            except Exception:
-                pass
-    return counts
-
-
-def load_seen_ids(path: str) -> set[str]:
-    seen = set()
-    if not os.path.exists(path):
-        return seen
-    with open(path) as f:
-        for line in f:
-            try:
-                seen.add(json.loads(line)["metadata"].get("technique_id", ""))
-            except Exception:
-                pass
-    return seen
-
-
-def print_progress(counts: dict[str, int]) -> None:
-    total_done   = sum(counts.values())
-    total_target = sum(BENCH_TARGET_PER_CAT.values())
-    print(f"\nCategory                        Done   Target   Progress")
-    print("─" * 58)
-    for cat in sorted(BENCH_TARGET_PER_CAT):
-        done   = counts.get(cat, 0)
-        target = BENCH_TARGET_PER_CAT[cat]
-        pct    = f"{100*done/target:.0f}%" if target else "N/A"
-        print(f"  {cat:<30} {done:>3} / {target:<3}    {pct}")
-    print("─" * 58)
-    print(f"  {'TOTAL':<30} {total_done:>3} / {total_target:<3}    "
-          f"{100*total_done/total_target:.0f}%\n")
+# ---------------------------------------------------------------------------
+# Progress display
+# ---------------------------------------------------------------------------
+def show_progress(cat_counts: dict, targets: dict) -> None:
+    total_done   = sum(cat_counts.values())
+    total_target = sum(targets.values())
+    print(f"\n  {'Category':<28} {'Done':>5} / {'Target':<6}  {'Bar'}")
+    print(f"  {'─'*28}  {'─'*5}   {'─'*6}  {'─'*22}")
+    for cat in sorted(targets):
+        done   = cat_counts.get(cat, 0)
+        target = targets[cat]
+        bar    = "█" * int(20 * done / max(1, target))
+        pct    = 100 * done / max(1, target)
+        print(f"  {cat:<28} {done:>5} / {target:<6}  {bar:<20}  {pct:.0f}%")
+    print(f"  {'TOTAL':<28} {total_done:>5} / {total_target:<6}  "
+          f"{100*total_done/max(1,total_target):.0f}%\n")
 
 
 # ---------------------------------------------------------------------------
@@ -401,160 +559,107 @@ def print_progress(counts: dict[str, int]) -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test",            action="store_true")
-    parser.add_argument("--test-n",          type=int, default=5)
+    parser.add_argument("--test",            action="store_true",
+                        help="Process 5 techniques, no file output")
     parser.add_argument("--list-categories", action="store_true")
-    parser.add_argument("--out",             default=OUTPUT_PATH)
-    parser.add_argument("--no-resume",       action="store_true")
     parser.add_argument("--workers",         type=int, default=DEFAULT_WORKERS)
     args = parser.parse_args()
 
+    Path("raw").mkdir(exist_ok=True)
+    Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
+
+    # Load tactic mapping from STIX
+    print("Loading ATT&CK tactic mapping from STIX…")
+    tactic_map = _load_stix_tactics()
+
+    # Fetch technique list from Atomic Red Team
+    print("Fetching Atomic Red Team technique list…")
+    technique_ids = fetch_technique_list()
+    print(f"  Found {len(technique_ids)} techniques in atomics/")
+
+    # Map each technique to its primary tactic
+    techniques: list[tuple[str, str, str]] = []  # (id, name, tactic)
+    for tid in technique_ids:
+        tactics = tactic_map.get(tid, [])
+        if not tactics:
+            continue
+        # Prefer the first tactic (primary)
+        tactic = tactics[0]
+        if tactic not in BENCH_TARGET_PER_CAT:
+            continue
+        # Technique display name — derive from STIX or just use the ID
+        techniques.append((tid, tid, tactic))
+
+    random.shuffle(techniques)
+
+    targets = dict(BENCH_TARGET_PER_CAT)
+
+    # Load existing examples to resume
+    done_ids: set[str] = set()
+    cat_counts: dict[str, int] = {c: 0 for c in targets}
+
+    if not args.test and Path(OUTPUT_PATH).exists():
+        with open(OUTPUT_PATH) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                ex  = json.loads(line)
+                tid = ex["metadata"].get("technique_id", "")
+                tn  = ex["metadata"].get("test_name", "")
+                cat = ex["metadata"].get("tactic", "")
+                done_ids.add(f"{tid}::{tn}")
+                if cat in cat_counts:
+                    cat_counts[cat] += 1
+
     if args.list_categories:
-        print_progress(load_existing_counts(args.out))
+        show_progress(cat_counts, targets)
         return
-
-    techniques = load_stix()
-    print(f"Active ATT&CK techniques: {len(techniques)}")
-
-    # Filter to techniques with useful platforms
-    usable = [
-        t for t in techniques
-        if _get_platforms(t)  # at least one target platform
-        and _get_tactics(t)   # has a mapped tactic
-    ]
-    print(f"Usable (target platform + tactic): {len(usable)}\n")
 
     if args.test:
-        print("=" * 70)
-        print(f"  TEST MODE — generating {args.test_n} technique scenarios")
-        print("=" * 70)
-        sample = random.sample(usable, min(args.test_n, len(usable)))
-        for t in sample:
-            t_id   = _get_technique_id(t)
-            name   = t["name"]
-            tactic = _get_tactics(t)[0] if _get_tactics(t) else "?"
-            platforms = _get_platforms(t)
-            print(f"\n{'─'*70}")
-            print(f"  {t_id} — {name}")
-            print(f"  Tactic   : {tactic}")
-            print(f"  Platforms: {platforms}")
-            print(f"  Generating {MIN_TURNS+1}-turn scenario...")
-            turns = generate_scenario(t, n_turns=MIN_TURNS+1)
-            if turns:
-                for i, turn in enumerate(turns):
-                    print(f"  Turn {i}: CMD={turn['command'][:80]!r}")
-                    if i == 0:
-                        print(f"  Thought: {turn['thought'][:200]!r}")
-            else:
-                print(f"  [FAIL] Could not parse scenario")
-        print("\n" + "=" * 70)
-        print("TEST COMPLETE")
-        print("=" * 70)
-        return
+        techniques = techniques[:5]
 
-    # Full run
-    resume     = not args.no_resume
-    cat_counts = load_existing_counts(args.out) if resume else {c: 0 for c in CATEGORIES}
-    seen_ids   = load_seen_ids(args.out)        if resume else set()
+    print(f"\nProcessing {len(techniques)} techniques (workers={args.workers})…\n")
+    show_progress(cat_counts, targets)
 
-    total_target = sum(BENCH_TARGET_PER_CAT.values())
-    total_done   = sum(cat_counts.values())
+    out_lock = threading.Lock()
+    out_file = open(OUTPUT_PATH, "a") if not args.test else None
 
-    if total_done >= total_target:
-        print("All categories at target.")
-        print_progress(cat_counts)
-        return
+    futures = {}
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        pbar = tqdm(total=sum(targets.values()), desc="ATT&CK examples")
+        pbar.update(sum(cat_counts.values()))
 
-    # Sort: deficit-first to fill underrepresented tactics sooner
-    def _deficit(t: dict) -> float:
-        tactic = _get_tactics(t)[0] if _get_tactics(t) else "unknown"
-        done   = cat_counts.get(tactic, 0)
-        target = BENCH_TARGET_PER_CAT.get(tactic, 0)
-        return (done / target) if target else 1.0
+        for tid, tname, tactic in techniques:
+            all_met = all(
+                cat_counts.get(cat, 0) >= targets.get(cat, 0)
+                for cat in targets
+            )
+            if all_met:
+                break
 
-    todo = [t for t in usable if _get_technique_id(t) not in seen_ids]
-    todo.sort(key=_deficit)   # underfilled tactics first
+            if cat_counts.get(tactic, 0) >= targets.get(tactic, 0):
+                continue
 
-    print(f"Techniques to process: {len(todo)}")
-    print_progress(cat_counts)
+            fut = pool.submit(
+                worker, tid, tname, tactic, cat_counts, targets,
+                done_ids, out_lock, out_file, args,
+            )
+            futures[fut] = tid
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        for fut in as_completed(futures):
+            n = fut.result()
+            pbar.update(n)
 
-    def _pick_tactic(technique: dict) -> str | None:
-        """
-        Pick the tactic with the most remaining capacity among all the
-        technique's tactics. Avoids blocking on a full first-tactic when the
-        technique also belongs to an underfull category.
-        Returns None if all tactics are at or above target.
-        """
-        all_tactics = _get_tactics(technique)
-        best = None
-        best_deficit = 0
-        for tac in all_tactics:
-            target  = BENCH_TARGET_PER_CAT.get(tac, 0)
-            done    = cat_counts.get(tac, 0)
-            deficit = target - done
-            if deficit > best_deficit:
-                best_deficit = deficit
-                best = tac
-        return best  # None if all at/above target
+        pbar.close()
 
-    def _worker(technique: dict) -> dict | None:
-        t_id = _get_technique_id(technique)
+    if out_file:
+        out_file.close()
 
-        with _write_lock:
-            tactic = _pick_tactic(technique)
-            if tactic is None:
-                return None  # all tactics full
+    print("\nFinal distribution:")
+    show_progress(cat_counts, targets)
 
-        try:
-            n_turns = random.randint(MIN_TURNS, MAX_TURNS)
-            turns = generate_scenario(technique, n_turns=n_turns)
-            if not turns:
-                return None
-        except Exception:
-            return None
-
-        example = build_example(technique, turns)
-        # Override category to the tactic we're filling
-        example["metadata"]["category"] = tactic
-        with _write_lock:
-            cat_counts[tactic] = cat_counts.get(tactic, 0) + 1
-            seen_ids.add(t_id)
-        return example
-
-    written = 0
-    cat_short = {c[:8]: 0 for c in CATEGORIES}
-
-    with open(args.out, "a") as outf:
-        with tqdm(total=total_target - total_done,
-                  desc="ATT&CK techniques",
-                  dynamic_ncols=True) as pbar:
-            with ThreadPoolExecutor(max_workers=args.workers) as pool:
-                futures = {pool.submit(_worker, t): t for t in todo}
-                for fut in as_completed(futures):
-                    result = fut.result()
-                    if result:
-                        outf.write(json.dumps(result) + "\n")
-                        outf.flush()
-                        written += 1
-                        cat = result["metadata"]["category"][:8]
-                        cat_short[cat] = cat_short.get(cat, 0) + 1
-                        pbar.set_postfix({k: v for k, v in cat_short.items() if v > 0})
-                        pbar.update(1)
-
-                    # Break only when every category has met its target.
-                    # Using total sum would break early when some categories
-                    # overshoot (e.g. reconnaissance at 23 vs target 20).
-                    all_met = all(
-                        cat_counts.get(cat, 0) >= BENCH_TARGET_PER_CAT.get(cat, 0)
-                        for cat in BENCH_TARGET_PER_CAT
-                    )
-                    if all_met:
-                        break
-
-    print(f"\nDone. Wrote {written} new examples.")
-    print_progress(load_existing_counts(args.out))
+    if args.test:
+        print("[--test mode] No file written.")
 
 
 if __name__ == "__main__":

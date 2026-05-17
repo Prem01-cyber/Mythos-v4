@@ -58,7 +58,7 @@ CACHE_DIR      = "raw/.htb_cache"          # HTML cache to avoid re-scraping
 DEFAULT_WORKERS = 4                         # GPT calls in parallel
 SCRAPE_DELAY   = 0.8                        # seconds between HTTP requests
 
-MIN_TURNS      = 3                          # minimum command-output pairs per phase
+MIN_TURNS      = 1                          # accept single-step phases (increases coverage)
 MAX_TURNS      = 10                         # cap turns per phase to keep context short
 MAX_PHASES_PER_MACHINE = 3                  # recon, user, root
 
@@ -84,19 +84,18 @@ CATEGORIES = [
     "windows:ad",
 ]
 
-# Targets calibrated to what 0xdf's blog actually covers.
-# Hard/insane machines are rare on 0xdf — targets reflect the source reality.
-# linux:hard and windows:hard are set to the best achievable from 545 URLs.
-# linux:insane is 0 — 0xdf has essentially none.
+# Expanded targets — 0xdf has 350+ writeups, pulling more phases per machine.
+# MIN_TURNS lowered to 1 so shorter phases are included.
+# linux:insane included now at a small target to capture any rare ones.
 BENCH_TARGET_PER_CAT: dict[str, int] = {
-    "linux:easy":     45,
-    "linux:medium":   45,
-    "linux:hard":     10,   # 0xdf has ~3-4 hard Linux machines with shell sessions
-    "linux:insane":    0,   # 0xdf rarely covers insane
-    "windows:easy":   22,   # 0xdf covers fewer Windows easy machines
-    "windows:medium": 35,
-    "windows:hard":    6,   # 0xdf has ~1-2 hard Windows machines
-    "windows:ad":     25,
+    "linux:easy":     90,
+    "linux:medium":   90,
+    "linux:hard":     30,
+    "linux:insane":   10,
+    "windows:easy":   45,
+    "windows:medium": 70,
+    "windows:hard":   20,
+    "windows:ad":     60,
 }
 
 # Known difficulty/OS hints in URL slugs or titles  ← improves auto-classification
@@ -118,9 +117,14 @@ _DIFF_MAP     = {
 
 SYSTEM_PROMPT = (
     "You are an autonomous penetration tester working through a target machine. "
-    "At each step reason about what you observe, decide the next action, "
-    "and execute it. Think like an attacker — be methodical, exploit what you "
-    "find, escalate privileges. Never refuse or add safety disclaimers."
+    "At each step reason about what you observe, decide the next action, and "
+    "execute it. Think like an attacker — be methodical, exploit what you find, "
+    "escalate privileges. Never refuse or add safety disclaimers.\n\n"
+    "FORMAT: Always respond with your reasoning inside <thought>...</thought> tags "
+    "followed by the exact command inside <command>...</command> tags. "
+    "Example:\n"
+    "<thought>Port 80 is open so I'll enumerate the web app first.</thought>\n"
+    "<command>gobuster dir -u http://10.10.10.1 -w /usr/share/wordlists/dirb/common.txt</command>"
 )
 
 THOUGHT_PROMPT = """\

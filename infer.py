@@ -503,14 +503,19 @@ def score_multiturn(text: str, adapter: str) -> dict:
     """Score HTB / Vulhub / ATT&CK outputs."""
     thought_m   = re.search(r"<thought>(.*?)</thought>", text, re.DOTALL)
     thought     = thought_m.group(1).strip() if thought_m else ""
-    # Accept bash, sh, powershell, python, cmd blocks
-    cmd_blocks  = re.findall(r"```(?:bash|sh|powershell|python|cmd|shell)?\n(.*?)```",
-                             text, re.DOTALL)
-    n_cmds      = len(cmd_blocks)
+
+    # Accept <command> tags (Vulhub training format) AND fenced code blocks
+    cmd_tag_blocks  = re.findall(r"<command>(.*?)</command>", text, re.DOTALL)
+    fence_blocks    = re.findall(r"```(?:bash|sh|powershell|python|cmd|shell|c)?\n(.*?)```",
+                                 text, re.DOTALL)
+    all_cmd_blocks  = cmd_tag_blocks + fence_blocks
+    n_cmds          = len(all_cmd_blocks)
+
     refused     = any(p in text.lower() for p in REFUSAL_PHRASES)
     truncated   = thought.rstrip().endswith(("=", ":", "{", ",", "(", "\\"))
-    # Check for inline commands even without fenced blocks
-    has_cmd_line = bool(re.search(r"\$\s+\S+|\bpython\b|\bnmap\b|\bcurl\b|\bmsf", text))
+    # Inline command heuristic as fallback
+    has_cmd_line = bool(re.search(r"\$\s+\S+|\bpython\b|\bnmap\b|\bcurl\b|\bmsf\b|\bmimikatz\b", text))
+
     return {
         "type":             adapter,
         "has_thought_tag":  bool(thought_m),
