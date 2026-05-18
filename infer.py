@@ -35,49 +35,15 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 ADAPTER_MAP = {
     # adapter_key: (best_adapter_path, base_model, is_qwen3)
-    # Paths point to best-adapter/ (LoRA weights only, ~150-300 MB).
-    # Base model is loaded separately and the adapter applied on top.
-    # To use a merged model instead: python3 infer.py --model path/to/merged
-    "exploitdb": (
-        "outputs/mythos-v4-exploitdb/best-adapter",
-        "Qwen/Qwen3-14B",
-        True,
-    ),
-    "htb": (
-        "outputs/mythos-v4-htb/best-adapter",
-        "Qwen/Qwen3-14B",
-        True,
-    ),
-    "vulhub": (
-        "outputs/mythos-v4-vulhub/best-adapter",
-        "Qwen/Qwen3-14B",
-        True,
-    ),
-    "attack": (
-        "outputs/mythos-v4-attack/best-adapter",
-        "Qwen/Qwen3-14B",
-        True,
-    ),
-    "ad": (
-        "outputs/mythos-v4-ad/best-adapter",
-        "Qwen/Qwen3-14B",
-        True,
-    ),
-    "webapp": (
-        "outputs/mythos-v4-webapp/best-adapter",
-        "Qwen/Qwen3-14B",
-        True,
-    ),
-    "osint": (
-        "outputs/mythos-v4-osint/best-adapter",
-        "Qwen/Qwen3-14B",
-        True,
-    ),
-    "cloud": (
-        "outputs/mythos-v4-cloud/best-adapter",
-        "Qwen/Qwen3-14B",
-        True,
-    ),
+    # All adapters are in adapters/ directory, trained on unsloth/Qwen3-14B base.
+    "exploitdb": ("adapters/mythos-v4-exploitdb/best-adapter", "unsloth/Qwen3-14B", True),
+    "htb":       ("adapters/mythos-v4-htb/best-adapter",       "unsloth/Qwen3-14B", True),
+    "vulhub":    ("adapters/mythos-v4-vulhub/best-adapter",    "unsloth/Qwen3-14B", True),
+    "attack":    ("adapters/mythos-v4-attack/best-adapter",    "unsloth/Qwen3-14B", True),
+    "ad":        ("adapters/mythos-v4-ad/best-adapter",        "unsloth/Qwen3-14B", True),
+    "webapp":    ("adapters/mythos-v4-webapp/best-adapter",    "unsloth/Qwen3-14B", True),
+    "osint":     ("adapters/mythos-v4-osint/best-adapter",     "unsloth/Qwen3-14B", True),
+    "cloud":     ("adapters/mythos-v4-cloud/best-adapter",     "unsloth/Qwen3-14B", True),
 }
 
 # ---------------------------------------------------------------------------
