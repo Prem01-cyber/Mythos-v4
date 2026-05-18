@@ -34,24 +34,47 @@ from pathlib import Path
 # Adapter registry
 # ---------------------------------------------------------------------------
 ADAPTER_MAP = {
-    # adapter_key: (merged_model_path, base_for_adapter_loading, is_qwen3)
+    # adapter_key: (best_adapter_path, base_model, is_qwen3)
+    # Paths point to best-adapter/ (LoRA weights only, ~150-300 MB).
+    # Base model is loaded separately and the adapter applied on top.
+    # To use a merged model instead: python3 infer.py --model path/to/merged
     "exploitdb": (
-        "outputs/mythos-v4-exploitdb/merged-bf16",
-        "Qwen/Qwen2.5-Coder-14B-Instruct",
-        False,
+        "outputs/mythos-v4-exploitdb/best-adapter",
+        "Qwen/Qwen3-14B",
+        True,
     ),
     "htb": (
-        "outputs/mythos-v4-htb/merged-bf16",
+        "outputs/mythos-v4-htb/best-adapter",
         "Qwen/Qwen3-14B",
         True,
     ),
     "vulhub": (
-        "outputs/mythos-v4-vulhub/merged-bf16",
+        "outputs/mythos-v4-vulhub/best-adapter",
         "Qwen/Qwen3-14B",
         True,
     ),
     "attack": (
-        "outputs/mythos-v4-attack/merged-bf16",
+        "outputs/mythos-v4-attack/best-adapter",
+        "Qwen/Qwen3-14B",
+        True,
+    ),
+    "ad": (
+        "outputs/mythos-v4-ad/best-adapter",
+        "Qwen/Qwen3-14B",
+        True,
+    ),
+    "webapp": (
+        "outputs/mythos-v4-webapp/best-adapter",
+        "Qwen/Qwen3-14B",
+        True,
+    ),
+    "osint": (
+        "outputs/mythos-v4-osint/best-adapter",
+        "Qwen/Qwen3-14B",
+        True,
+    ),
+    "cloud": (
+        "outputs/mythos-v4-cloud/best-adapter",
         "Qwen/Qwen3-14B",
         True,
     ),
@@ -61,8 +84,9 @@ ADAPTER_MAP = {
 # CLI
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
-parser.add_argument("--adapter",    default=None, choices=list(ADAPTER_MAP.keys()),
-                    help="Which adapter to evaluate (auto-resolves model path)")
+parser.add_argument("--adapter",    default=None,
+                    choices=["exploitdb", "htb", "vulhub", "attack", "ad", "webapp", "osint", "cloud"],
+                    help="Which adapter to evaluate (auto-resolves to best-adapter path)")
 parser.add_argument("--model",      default=None,
                     help="Override model path (merged model or adapter dir)")
 parser.add_argument("--base",       default=None,
