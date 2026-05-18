@@ -1,0 +1,51 @@
+{
+  "program": "Meesho Bug Bounty (HackerOne)",
+  "mode": "bug_bounty",
+  "researcher": "aquamarine_skeleton",
+  "test_header": "X-Hackerone: aquamarine_skeleton",
+  "in_scope": [
+    {"type": "web",    "value": "meesho.com",          "priority": "high"},
+    {"type": "web",    "value": "supplier.meesho.com",  "priority": "high"},
+    {"type": "mobile", "value": "Meesho Android App",   "priority": "high"},
+    {"type": "mobile", "value": "Meesho iOS App",        "priority": "medium"},
+    {"type": "mobile", "value": "Valmo Mobile App",      "priority": "medium"}
+  ],
+  "out_of_scope": [
+    {"type": "vuln", "value": "rate-limiting"},
+    {"type": "vuln", "value": "username-enumeration"},
+    {"type": "vuln", "value": "clickjacking"},
+    {"type": "vuln", "value": "csrf-login-logout"},
+    {"type": "vuln", "value": "missing-security-headers"},
+    {"type": "vuln", "value": "self-xss"},
+    {"type": "vuln", "value": "open-redirect-no-chain"},
+    {"type": "vuln", "value": "spf-dkim-dmarc"},
+    {"type": "vuln", "value": "subdomain-takeover-no-poc"},
+    {"type": "vuln", "value": "ssrf-pingback-only"},
+    {"type": "vuln", "value": "cors-no-impact"},
+    {"type": "vuln", "value": "file-upload-xss-supplier"},
+    {"type": "vuln", "value": "html-injection-ticketing"},
+    {"type": "vuln", "value": "bank-otp-bypass"},
+    {"type": "vuln", "value": "account-deletion-discount-misuse"}
+  ],
+  "notes": "Known dupes: HTML injection in ticketing, Stored XSS via file upload, Bank/UPI OTP bypass, Account deletion discount misuse. Test accounts: supplier=suppliertest-1@meeshoai.com/Hackerone@123$, consumer=6666666661/OTP:999999. Include header X-Hackerone: aquamarine_skeleton in all requests.",
+  "test_accounts": {
+    "supplier": {
+      "user1": "suppliertest-1@meeshoai.com",
+      "user2": "suppliertest-2@meeshoai.com",
+      "password": "Hackerone@123$"
+    },
+    "consumer": {
+      "mobile1": "6666666661",
+      "mobile2": "6666666662",
+      "otp": "999999"
+    }
+  },
+  "reward_table": {
+    "mobile_critical": "$1700-$2500",
+    "mobile_high":     "$800-$1700",
+    "web_critical":    "$1200-$2000",
+    "web_high":        "$600-$1200",
+    "web_medium":      "$150-$600",
+    "web_low":         "$50-$150"
+  }
+}
