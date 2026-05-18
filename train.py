@@ -360,12 +360,16 @@ training_args = SFTConfig(
     # loss looks noisy.
     packing                  = False,
 
-    # Eval
+    # Eval & checkpointing
+    # save_total_limit=1 + load_best_model_at_end=True: HuggingFace guarantees
+    # the best checkpoint is never deleted, so at most 2 dirs exist on disk at
+    # any time (latest + best if they differ). After training completes, we copy
+    # the best adapter out and delete all checkpoint dirs entirely.
     eval_strategy            = "steps",
     eval_steps               = steps_per_epoch,   # eval once per epoch
     save_strategy            = "steps",
     save_steps               = steps_per_epoch,
-    save_total_limit         = 3,                 # keep last 3 checkpoints
+    save_total_limit         = 1,                 # only keep 1 checkpoint; best is always preserved
     load_best_model_at_end   = True,
     metric_for_best_model    = "eval_loss",
     greater_is_better        = False,
@@ -401,12 +405,25 @@ print("Starting training...\n")
 trainer_stats = trainer.train()
 
 # ---------------------------------------------------------------------------
-# Save final adapter
+# Save best adapter — load_best_model_at_end already restored best weights
 # ---------------------------------------------------------------------------
-adapter_path = os.path.join(OUTPUT_DIR, "final-adapter")
+import shutil
+
+adapter_path = os.path.join(OUTPUT_DIR, "best-adapter")
 model.save_pretrained(adapter_path)
 tokenizer.save_pretrained(adapter_path)
-print(f"\nAdapter saved to: {adapter_path}")
+print(f"\nBest adapter saved → {adapter_path}")
+
+# Delete all intermediate checkpoint dirs — keep only best-adapter/
+# Merged model is NOT saved here; create it on-demand with merge.py when needed.
+ckpt_dirs = [
+    d for d in Path(OUTPUT_DIR).iterdir()
+    if d.is_dir() and d.name.startswith("checkpoint-")
+]
+for ckpt in ckpt_dirs:
+    shutil.rmtree(ckpt)
+    print(f"  Removed checkpoint dir: {ckpt.name}")
+print(f"  Disk usage: {sum(f.stat().st_size for f in Path(adapter_path).rglob('*') if f.is_file()) / 1e6:.0f} MB")
 
 # ---------------------------------------------------------------------------
 # Training summary
@@ -418,14 +435,8 @@ print(f"{'═'*60}")
 print(f"  Runtime        : {elapsed_min:.1f} min")
 print(f"  Train loss     : {trainer_stats.metrics['train_loss']:.4f}")
 print(f"  Samples/sec    : {trainer_stats.metrics['train_samples_per_second']:.1f}")
-print(f"  Adapter        : {adapter_path}")
+print(f"  Best adapter   : {adapter_path}")
 print(f"  Cost estimate  : ~${elapsed_min / 60 * 1.807:.2f} at $1.807/hr")
 print(f"{'═'*60}\n")
-
-# ---------------------------------------------------------------------------
-# Optional: merge adapter into base for single-file deployment
-# ---------------------------------------------------------------------------
-print("Merging adapter into base weights (for single-file deployment)...")
-merged_path = os.path.join(OUTPUT_DIR, "merged-bf16")
-model.save_pretrained_merged(merged_path, tokenizer, save_method="merged_16bit")
-print(f"Merged model saved to: {merged_path}")
+print("To merge into a single model when needed:")
+print(f"  python3 merge.py --source {args.source or 'htb'}")
