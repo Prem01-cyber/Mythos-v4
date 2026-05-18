@@ -1,0 +1,59 @@
+{
+  "program": "Coupang Taiwan",
+  "platform": "HackerOne",
+  "handle": "coupang_tw",
+  "url": "https://www.tw.coupang.com",
+  "researcher_handle": "aquamarine_skeleton",
+  "test_header": "X-HackerOne-Researcher: aquamarine_skeleton",
+  "rewards": {
+    "critical": "$4,000 - $6,000",
+    "high": "$1,500 - $3,000",
+    "medium": "$400 - $600",
+    "low": "$50 - $200"
+  },
+  "notes": [
+    "Korea and Taiwan assets share overlapping backend code — first valid submission wins, subsequent ones marked duplicate.",
+    "IDORs with unpredictable IDs must prove how the ID was obtained easily.",
+    "Use hacker email alias h1username@wearehackerone.com when signing up test accounts.",
+    "Do not discuss or disclose any findings without express consent."
+  ],
+  "in_scope": [
+    { "type": "web", "value": "www.tw.coupang.com" },
+    { "type": "web", "value": "*.tw.coupang.com" },
+    { "type": "api", "value": "api.tw.coupang.com" },
+    { "type": "web", "value": "m.tw.coupang.com" },
+    { "type": "web", "value": "sellers.tw.coupang.com" },
+    { "type": "web", "value": "wing.tw.coupang.com" },
+    { "type": "web", "value": "cs.tw.coupang.com" },
+    { "type": "web", "value": "pay.tw.coupang.com" },
+    { "type": "web", "value": "member.tw.coupang.com" },
+    { "type": "android", "value": "Coupang Taiwan Android App" },
+    { "type": "ios", "value": "Coupang Taiwan iOS App" }
+  ],
+  "out_of_scope": [
+    { "type": "category", "value": "Infrastructure attacks" },
+    { "type": "category", "value": "DoS attacks" },
+    { "type": "category", "value": "Social engineering / phishing" },
+    { "type": "category", "value": "MiTM or physical device access attacks" },
+    { "type": "category", "value": "Attacks requiring jailbroken/rooted device" },
+    { "type": "finding", "value": "CSRF with minor impact (e.g., logout)" },
+    { "type": "finding", "value": "Password policy improvements" },
+    { "type": "finding", "value": "Missing security headers" },
+    { "type": "finding", "value": "Internal IP or domain leakage" },
+    { "type": "finding", "value": "Error messages or version information disclosure" },
+    { "type": "finding", "value": "Self-XSS or unlikely user interaction required" },
+    { "type": "finding", "value": "Publicly known vulnerabilities" },
+    { "type": "finding", "value": "Issues Coupang is already aware of" },
+    { "type": "finding", "value": "IDOR with unpredictable ID where obtainability is not demonstrated" }
+  ],
+  "priority_targets": [
+    "Authentication & session management (login, OAuth, SSO)",
+    "IDOR in order, cart, payment, and account flows",
+    "Business logic in checkout / coupon / refund flows",
+    "API authorization — horizontal and vertical privilege escalation",
+    "Seller / Wing portal privilege escalation",
+    "Payment gateway integration (pay.tw.coupang.com)",
+    "XSS in product listings, search, or review components",
+    "Leaked credentials or API keys in JS bundles / responses"
+  ]
+}
