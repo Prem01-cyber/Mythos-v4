@@ -72,7 +72,7 @@ parser.add_argument("--source",  default=None,
                     help="Which dataset to train on. "
                          "exploitdb → exploit code adapter (3 epochs, seq=2048); "
                          "htb → pentest methodology adapter (3 epochs, seq=2560); "
-                         "vulhub → CVE exploitation adapter (8 epochs, seq=2048); "
+                         "vulhub → CVE exploitation adapter (4 epochs, seq=2048); "  # overfit observed at epoch 3 in first run
                          "attack → ATT&CK red team adapter (5 epochs, seq=1280); "
                          "ad → Active Directory adapter (12 epochs, seq=1024); "
                          "webapp → web app exploitation adapter (10 epochs, seq=1792); "
@@ -134,7 +134,7 @@ MODEL_NAME = MODEL_MAP[args.model]
 # Epoch targets — calibrated to ~350-420 gradient steps (eff_batch=16):
 #   exploitdb: 2144 ex / 16 × 3 epochs = 402 steps ✓
 #   htb:       1946 ex / 16 × 3 epochs = 365 steps ✓
-#   vulhub:     644 ex / 16 × 8 epochs = 322 steps ✓
+#   vulhub:     644 ex / 16 × 4 epochs = 161 steps  (eval loss minimum at epoch 3; 8 was overfitting)
 #   attack:    1230 ex / 16 × 5 epochs = 384 steps ✓
 #   ad:         274 ex / 16 × 12 epochs = 205 steps (small dataset, more passes)
 #   webapp:     326 ex / 16 × 10 epochs = 204 steps
@@ -144,7 +144,7 @@ SOURCE_MAP = {
     # source   (data path,                        output dir,                    epochs, seq_len)
     "exploitdb": ("processed/exploitdb.jsonl",    "outputs/mythos-v4-exploitdb",  3,   2048),
     "htb":       ("processed/htb_writeups.jsonl", "outputs/mythos-v4-htb",        3,   2560),
-    "vulhub":    ("processed/vulhub.jsonl",        "outputs/mythos-v4-vulhub",     8,   2048),
+    "vulhub":    ("processed/vulhub.jsonl",        "outputs/mythos-v4-vulhub",     4,   2048),  # best at epoch 3 (0.5236); 4 gives headroom
     "attack":    ("processed/attack.jsonl",        "outputs/mythos-v4-attack",     5,   1280),
     "ad":        ("processed/ad.jsonl",            "outputs/mythos-v4-ad",        12,   1024),
     "webapp":    ("processed/webapp.jsonl",        "outputs/mythos-v4-webapp",    10,   1792),
