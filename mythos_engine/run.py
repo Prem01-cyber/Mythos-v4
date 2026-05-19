@@ -55,8 +55,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                    help="Enable live command execution (model commands run via subprocess). "
                         "Default: OFF (model advises only). "
                         "CAUTION: Only use on authorised targets.")
-    p.add_argument("--execution-timeout", type=int, default=30, metavar="SECONDS",
-                   help="Timeout per command in seconds (default: 30)")
+    p.add_argument("--execution-timeout", type=int, default=300, metavar="SECONDS",
+                   help="Base timeout per command in seconds (default: 300). "
+                        "Slow tools like nmap/ffuf/sqlmap use longer per-tool overrides.")
 
     # ── Bug bounty ────────────────────────────────────────────────────────────
     p.add_argument("--bug-bounty", action="store_true",
