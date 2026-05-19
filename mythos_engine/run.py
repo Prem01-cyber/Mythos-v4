@@ -208,47 +208,38 @@ async def _run_tui(args: argparse.Namespace, config: "PentestGPTConfig") -> None
 
 
 async def _run_cli(args: argparse.Namespace, config: "PentestGPTConfig") -> None:
-    """Headless streaming CLI mode."""
-    from rich.console import Console
+    """Headless streaming CLI mode — styled with Rich to match TUI information density."""
     from pentestgpt.core.controller import AgentController
-    from pentestgpt.core.events import EventBus, EventType, Event
+    from pentestgpt.core.events import EventBus, EventType
+    from pentestgpt.interface.cli_renderer import MythosCLIRenderer
 
-    console = Console()
-    console.print(f"[bold #f59e0b]⚡ Mythos Engine[/] [dim]—[/] target: [bold]{config.target}[/]")
-    if args.mock:
-        console.print("[yellow]Mock mode (no GPU)[/]")
-    if getattr(args, "execute", False):
-        console.print("[bold red]EXECUTION ENABLED — commands will run live[/]")
-    if getattr(args, "bug_bounty", False):
-        scope_info = f" (scope: {args.scope})" if getattr(args, "scope", None) else ""
-        console.print(f"[cyan]Bug bounty mode{scope_info}[/]")
-    console.print()
+    backend  = _build_backend(config, mock=args.mock)
+    events   = EventBus.get()
 
-    backend = _build_backend(config, mock=args.mock)
-    events  = EventBus.get()
+    renderer = MythosCLIRenderer(
+        target      = config.target,
+        backend     = backend,
+        execute     = getattr(args, "execute",    False),
+        bug_bounty  = getattr(args, "bug_bounty", False),
+        scope_file  = getattr(args, "scope",      None),
+        program     = getattr(args, "program",    "") or "",
+        mock        = args.mock,
+    )
+    renderer.print_header()
 
-    def on_msg(event: Event) -> None:
-        text = event.data.get("text", "")
-        if text and not event.data.get("routing"):
-            console.print(text)
-
-    def on_state(event: Event) -> None:
-        state   = event.data.get("state", "")
-        details = event.data.get("details", "")
-        if details:
-            console.print(f"[dim][{state}] {details}[/]")
-
-    events.subscribe(EventType.MESSAGE, on_msg)
-    events.subscribe(EventType.STATE_CHANGED, on_state)
+    # Wire all event types — same set as the TUI
+    events.subscribe(EventType.MESSAGE,       renderer.on_message)
+    events.subscribe(EventType.STATE_CHANGED, renderer.on_state_changed)
+    events.subscribe(EventType.TOOL,          renderer.on_tool)
+    events.subscribe(EventType.FLAG_FOUND,    renderer.on_flag)
 
     controller = AgentController(config=config, backend=backend, events=events)
     task = args.instruction or f"Begin penetration testing against: {config.target}"
 
     result = await controller.run(task, resume_session_id=args.session)
-    if result.get("success"):
-        console.print(f"\n[bold green]✓ Complete[/]  flags={result.get('flags_found', [])}")
-    else:
-        console.print(f"\n[bold red]✗ Error:[/] {result.get('error')}")
+    renderer.print_summary(result)
+
+    if not result.get("success"):
         sys.exit(1)
 
 
