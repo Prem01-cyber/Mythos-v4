@@ -65,6 +65,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--scope", metavar="SCOPE_FILE",
                    help="Path to JSON scope file for bug bounty mode. "
                         "See docs for format. If omitted, target domain is used as scope.")
+    p.add_argument("--program", metavar="HANDLE", default="",
+                   help="Bug bounty program handle (e.g. coupang_tw). Used to load/save "
+                        "the engagement knowledge store across sessions.")
 
     # ── Metasploit ────────────────────────────────────────────────────────────
     p.add_argument("--msf", action="store_true",
@@ -152,6 +155,7 @@ def _build_config(args: argparse.Namespace) -> "PentestGPTConfig":
         # Bug bounty
         bug_bounty=getattr(args, "bug_bounty", False),
         scope_file=getattr(args, "scope", None),
+        program_handle=getattr(args, "program", "") or "",
         # RAG
         rag_enabled=getattr(args, "rag", False),
         rag_max_age_hours=getattr(args, "rag_max_age", 24),
@@ -247,6 +251,26 @@ async def _run_cli(args: argparse.Namespace, config: "PentestGPTConfig") -> None
         sys.exit(1)
 
 
+def _check_bootstrap() -> None:
+    """Warn (and optionally auto-run bootstrap) if state.json is missing."""
+    state_file = Path.home() / ".mythosengine" / "state.json"
+    if state_file.exists():
+        return
+
+    # Find bootstrap.py relative to this run.py (one level up from mythos_engine/)
+    bootstrap = Path(__file__).resolve().parent.parent / "bootstrap.py"
+    print("\n[!] ~/.mythosengine/state.json not found — environment not bootstrapped.")
+    if bootstrap.exists():
+        print(f"    Running bootstrap automatically: python3 {bootstrap}\n")
+        import subprocess
+        result = subprocess.run([sys.executable, str(bootstrap), "--quiet"], check=False)
+        if result.returncode != 0:
+            print("[!] Bootstrap reported missing required resources. See above.")
+    else:
+        print(f"    Run: python3 {bootstrap} (or python3 bootstrap.py from project root)")
+    print()
+
+
 def main() -> None:
     parser = _build_arg_parser()
     args   = parser.parse_args()
@@ -261,6 +285,9 @@ def main() -> None:
 
     if not args.target and not args.list_sessions:
         parser.error("--target is required unless --list-sessions is used")
+
+    # Ensure machine is bootstrapped before loading the model
+    _check_bootstrap()
 
     config = _build_config(args)
 

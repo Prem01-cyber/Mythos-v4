@@ -32,8 +32,46 @@ else
 fi
 
 info "Detected package manager: ${PKG_MGR}"
+
+# ── Dynamic install dir — writable system dir preferred, else user local ──────
+if [[ -w "/usr/local/bin" ]]; then
+    INSTALL_DIR="/usr/local/bin"
+elif [[ -w "/usr/bin" ]]; then
+    INSTALL_DIR="/usr/bin"
+else
+    INSTALL_DIR="${HOME}/.local/bin"
+    mkdir -p "$INSTALL_DIR"
+    # Ensure it's on PATH for this session
+    export PATH="$INSTALL_DIR:$PATH"
+    warn "Using user-local install dir: ${INSTALL_DIR} (add to PATH permanently if needed)"
+fi
+info "Tool install dir: ${INSTALL_DIR}"
+
 GO_BIN_DIR="/usr/local/go/bin"
-INSTALL_DIR="/usr/local/bin"
+# State file written by bootstrap.py
+STATE_FILE="${HOME}/.mythosengine/state.json"
+mkdir -p "${HOME}/.mythosengine"
+
+# ── Helper: update a tool path in state.json after install ────────────────────
+_state_update_tool() {
+    local tool="$1"
+    local path
+    path="$(command -v "$tool" 2>/dev/null || echo "")"
+    [[ -z "$path" ]] && return
+    if command -v python3 &>/dev/null; then
+        python3 - "$STATE_FILE" "$tool" "$path" <<'PYEOF'
+import json, sys
+state_file, tool, path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    state = json.loads(open(state_file).read()) if __import__('os').path.exists(state_file) else {}
+except Exception:
+    state = {}
+state.setdefault("tools", {})
+state["tools"][tool] = {"path": path, "installed": True}
+open(state_file, "w").write(json.dumps(state, indent=2))
+PYEOF
+    fi
+}
 
 # ── Helper: install a binary tool, track failures ─────────────────────────
 install_pkg() {
@@ -464,6 +502,7 @@ ALL_OK=true
 for t in "${TOOLS[@]}"; do
     if command -v "$t" &>/dev/null; then
         printf "  ${GREEN}✓${RESET} %-20s %s\n" "$t" "$(command -v "$t")"
+        _state_update_tool "$t"
     else
         printf "  ${RED}✗${RESET} %-20s NOT FOUND\n" "$t"
         ALL_OK=false
@@ -492,5 +531,22 @@ else
     warn "Some tools could not be installed. See above."
 fi
 
+# ── Write install_dir into state.json ────────────────────────────────────────
+if command -v python3 &>/dev/null; then
+    python3 - "$STATE_FILE" "$INSTALL_DIR" <<'PYEOF'
+import json, sys, os
+state_file, install_dir = sys.argv[1], sys.argv[2]
+try:
+    state = json.loads(open(state_file).read()) if os.path.exists(state_file) else {}
+except Exception:
+    state = {}
+state["install_dir"] = install_dir
+open(state_file, "w").write(json.dumps(state, indent=2))
+print(f"  [+] state.json updated with install_dir={install_dir}")
+PYEOF
+fi
+
 echo -e "\n${BOLD}Mythos Engine is ready. Run with:${RESET}"
 echo "  cd mythos_engine && python3 run.py --target <host> --bug-bounty --scope ../engagements/coupang-tw/scope.json --rag --execute"
+echo ""
+echo "  To re-verify environment:  python3 bootstrap.py --check"
