@@ -30,10 +30,26 @@ MSG_OVERHEAD = 4
 REPLY_PRIMER = 2
 
 SOURCES = [
-    ("processed/exploitdb.jsonl", "ExploitDB",  "exploit code + reasoning (single-turn)"),
-    ("raw/htb_writeups.jsonl",    "HTB",         "pentest methodology (multi-turn, 7 turns avg)"),
-    ("raw/vulhub.jsonl",          "Vulhub",      "CVE exploitation chains (1–7 turns)"),
-    ("raw/attack.jsonl",          "ATT&CK",      "red team techniques (4 turns avg)"),
+    # ── Existing adapters ──────────────────────────────────────────────────
+    ("processed/exploitdb.jsonl",          "ExploitDB",          "exploit code + reasoning (single-turn)"),
+    ("raw/htb_writeups.jsonl",             "HTB",                "pentest methodology (multi-turn, 7 turns avg)"),
+    ("raw/vulhub.jsonl",                   "Vulhub",             "CVE exploitation chains (1–7 turns)"),
+    ("raw/attack.jsonl",                   "ATT&CK",             "red team techniques (4 turns avg)"),
+    ("raw/ad.jsonl",                       "AD",                 "Active Directory attack chains"),
+    ("raw/webapp.jsonl",                   "WebApp",             "web application testing chains"),
+    ("raw/osint.jsonl",                    "OSINT",              "external recon methodology chains"),
+    ("raw/cloud.jsonl",                    "Cloud",              "AWS/Azure/GCP attack chains"),
+    # ── New adapter sources (source10 / source11 / source12) ──────────────
+    ("raw/executor_correction.jsonl",      "Executor-Correction","command correction: bad cmd + stderr → fix"),
+    ("raw/executor_filtering.jsonl",       "Executor-Filtering", "output filtering: noisy output → findings"),
+    ("raw/analyst_h1.jsonl",               "Analyst-H1",         "HackerOne reports → structured findings"),
+    ("raw/analyst_synth.jsonl",            "Analyst-Synth",      "synthetic tool output → analyst chains"),
+    ("raw/planner_decomp.jsonl",           "Planner-Decomp",     "target + phase → step-by-step attack plan"),
+    ("raw/planner_replan.jsonl",           "Planner-Replan",     "unexpected result → adaptive re-plan"),
+    # ── Researcher adapter (source13) ─────────────────────────────────────
+    ("raw/researcher_synth.jsonl",         "Researcher-Synth",   "synthetic: standard tools fail → anomaly reasoning → novel finding"),
+    ("raw/researcher_pz.jsonl",            "Researcher-PZ",      "Project Zero reconstructions → hypothesis chains"),
+    ("raw/researcher_ctf.jsonl",           "Researcher-CTF",     "novel CTF writeups → hypothesis chains"),
 ]
 
 LIMITS = [1024, 2048, 3000, 4096, 8192]
