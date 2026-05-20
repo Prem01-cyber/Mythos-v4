@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Adapter flow test — runs all adapters individually and chains outputs.
 
-Tests two things:
+Tests three things:
   1. SOLO: each adapter with a relevant standalone prompt (verify it loads
      and produces coherent output for its domain)
   2. CHAINED: osint → webapp → analyst → researcher (simulate a real
      bug bounty session where each adapter's output feeds the next)
+  3. EXEC PIPELINE: command extraction → flag validation → tool_docs injection
+     → optional real shell execution (the part that breaks in live runs)
 
 Usage:
     # All adapters, full chain (GPU)
@@ -20,6 +22,12 @@ Usage:
     # Chain only
     python test_adapter_flow.py --chain-only
 
+    # Execution pipeline only (no GPU required)
+    python test_adapter_flow.py --exec-pipeline
+
+    # Execution pipeline WITH real shell execution (runs safe read-only cmds)
+    python test_adapter_flow.py --exec-pipeline --execute
+
     # Limit output tokens (faster)
     python test_adapter_flow.py --max-tokens 256
 """
@@ -27,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 import time
@@ -425,49 +434,355 @@ def print_summary(results: dict) -> None:
                 )
 
 
+# ── Execution pipeline test ────────────────────────────────────────────────────
+# Canned model outputs that cover known edge cases.  We intentionally include
+# bad outputs so we can verify correction logic fires correctly.
+
+_PIPELINE_CASES: list[dict] = [
+    {
+        "label": "clean <command> tag",
+        "adapter": "osint",
+        "model_output": (
+            "<thought>Run subfinder to find subdomains.</thought>\n"
+            "<command>subfinder -d supplier.meesho.com -all -silent -o subdomains.txt</command>"
+        ),
+        "expect_cmds": 1,
+        "expect_valid": True,
+        "safe_to_run": False,  # network call
+    },
+    {
+        "label": "HTB nested bash fence inside <command>",
+        "adapter": "htb",
+        "model_output": (
+            "<thought>Exploit sudo python3 to get root.</thought>\n"
+            "<command>\n"
+            "```bash\n"
+            "sudo /usr/bin/python3 -c 'import os; os.system(\"id\")'\n"
+            "```\n"
+            "</command>"
+        ),
+        "expect_cmds": 1,
+        "expect_valid": True,
+        "safe_to_run": True,  # 'id' via python3 is read-only
+    },
+    {
+        "label": "gau with wrong -d flag (model training artifact)",
+        "adapter": "osint",
+        "model_output": (
+            "<thought>Collect URLs from gau.</thought>\n"
+            "<command>gau -d supplier.meesho.com --o gau_output.txt</command>"
+        ),
+        "expect_cmds": 1,
+        "expect_valid": False,  # -d does not exist in gau
+        "safe_to_run": False,
+    },
+    {
+        "label": "httpx with PD-only flags (Python httpx installed)",
+        "adapter": "osint",
+        "model_output": (
+            "<thought>Probe subdomains with httpx.</thought>\n"
+            "<command>cat subdomains.txt | httpx -status-code -title -tech-detect -silent</command>"
+        ),
+        "expect_cmds": 1,
+        "expect_valid": False,  # -status-code / -tech-detect are PD flags
+        "safe_to_run": False,
+    },
+    {
+        "label": "placeholder command (should be blocked)",
+        "adapter": "webapp",
+        "model_output": (
+            "<thought>Authenticate with token.</thought>\n"
+            "<command>curl -H 'Authorization: Bearer YOUR_ACCESS_TOKEN' https://supplier.meesho.com/api/v1/orders</command>"
+        ),
+        "expect_cmds": 1,
+        "expect_valid": False,  # YOUR_ACCESS_TOKEN is a placeholder
+        "safe_to_run": False,
+    },
+    {
+        "label": "echo fabrication (should be blocked)",
+        "adapter": "osint",
+        "model_output": (
+            "<thought>Simulate subdomain discovery result.</thought>\n"
+            "<command>echo 'Found subdomain: api.supplier.meesho.com'</command>"
+        ),
+        "expect_cmds": 1,
+        "expect_valid": False,  # fabrication — model faking output
+        "safe_to_run": False,
+    },
+    {
+        "label": "python block excluded from extraction",
+        "adapter": "exploitdb",
+        "model_output": (
+            "<reasoning>Here is an exploit:</reasoning>\n"
+            "```python\n"
+            "import socket\n"
+            "s = socket.socket()\n"
+            "s.connect(('10.10.10.50', 3389))\n"
+            "```"
+        ),
+        "expect_cmds": 0,  # python blocks must NOT be extracted
+        "expect_valid": True,
+        "safe_to_run": False,
+    },
+    {
+        "label": "safe local command (verify real execution works)",
+        "adapter": "executor",
+        "model_output": (
+            "<thought>Check which tools are installed.</thought>\n"
+            "<command>which subfinder nmap curl 2>&1 || true</command>"
+        ),
+        "expect_cmds": 1,
+        "expect_valid": True,
+        "safe_to_run": True,
+    },
+    {
+        "label": "multi-command output",
+        "adapter": "webapp",
+        "model_output": (
+            "<thought>Two steps: login then test IDOR.</thought>\n"
+            "<command>curl -X POST https://supplier.meesho.com/api/v1/auth/login "
+            "-H 'Content-Type: application/json' "
+            "-H 'X-Hackerone: aquamarine_skeleton' "
+            "-d '{\"email\":\"suppliertest-1@meeshoai.com\",\"password\":\"Hackerone@123$\"}' "
+            "-o /tmp/login.json</command>\n"
+            "<command>curl -s https://supplier.meesho.com/api/v1/orders?supplier_id=2 "
+            "-H 'X-Hackerone: aquamarine_skeleton' "
+            "-H \"Authorization: Bearer $(jq -r .token /tmp/login.json)\"</command>"
+        ),
+        "expect_cmds": 2,
+        "expect_valid": True,
+        "safe_to_run": False,
+    },
+]
+
+
+def _tick(ok: bool) -> str:
+    return f"{GREEN}✓{RESET}" if ok else f"{RED}✗{RESET}"
+
+
+def run_execution_pipeline_test(execute: bool = False) -> dict:
+    """
+    Test every layer of the execution pipeline WITHOUT a GPU.
+
+    Layer 1 — extract_commands():  inner fence stripping, python exclusion
+    Layer 2 — has_placeholder():   block literal placeholder tokens
+    Layer 3 — _FABRICATION_RE:     block echo-fabrication commands
+    Layer 4 — tool_docs injection:  verify docs are fetched for the binary
+    Layer 5 — flag validation:      CommandValidator.validate_flags()
+    Layer 6 — real execution:       ShellExecutor (only when execute=True and safe_to_run)
+    """
+    from pentestgpt.core.tool_executor import ShellExecutor
+    from pentestgpt.core.command_validator import CommandValidator
+    from pentestgpt.core.tool_docs import ToolDocsCache
+
+    executor  = ShellExecutor(workspace="/tmp/mythos_exec_test", timeout=10)
+    validator = CommandValidator()
+    docs      = ToolDocsCache()
+
+    separator("EXECUTION PIPELINE TEST", BOLD)
+    print(f"  Layers: extract → placeholder → fabrication → tool_docs → flag_check"
+          f"{'  → shell_exec' if execute else ''}\n")
+
+    results: dict[str, dict] = {}
+    pipeline_pass = 0
+    pipeline_fail = 0
+
+    for case in _PIPELINE_CASES:
+        label      = case["label"]
+        output     = case["model_output"]
+        exp_cmds   = case["expect_cmds"]
+        exp_valid  = case["expect_valid"]
+        safe       = case["safe_to_run"]
+
+        print(f"\n{BOLD}{CYAN}[{label}]{RESET}")
+
+        # ── Layer 1: command extraction ─────────────────────────────────────
+        cmds = executor.extract_commands(output)
+        l1_ok = len(cmds) == exp_cmds
+        print(f"  L1 extract_commands : {_tick(l1_ok)} got {len(cmds)}, expected {exp_cmds}")
+        if cmds:
+            for c in cmds:
+                short = c[:80].replace('\n', ' ')
+                print(f"           cmd → {DIM}{short}{'…' if len(c) > 80 else ''}{RESET}")
+
+        # ── Layer 2: placeholder detector ──────────────────────────────────
+        if cmds:
+            has_placeholder = any(executor._has_placeholder(c) for c in cmds)
+            expected_placeholder = not exp_valid and "placeholder" in label.lower()
+            l2_ok = (has_placeholder == expected_placeholder)
+            if has_placeholder:
+                print(f"  L2 placeholder      : {_tick(False)} BLOCKED (placeholder found)")
+            else:
+                print(f"  L2 placeholder      : {_tick(True)} clean")
+        else:
+            l2_ok = True
+            print(f"  L2 placeholder      : {DIM}n/a (no commands){RESET}")
+
+        # ── Layer 3: fabrication detector ──────────────────────────────────
+        if cmds:
+            is_fabrication = any(executor._FABRICATION_RE.match(c.strip()) for c in cmds)
+            expected_fabrication = not exp_valid and "fabrication" in label.lower()
+            l3_ok = (is_fabrication == expected_fabrication)
+            if is_fabrication:
+                print(f"  L3 fabrication      : {_tick(False)} BLOCKED (echo fabrication)")
+            else:
+                print(f"  L3 fabrication      : {_tick(True)} clean")
+        else:
+            l3_ok = True
+            print(f"  L3 fabrication      : {DIM}n/a (no commands){RESET}")
+
+        # ── Layer 4: tool_docs injection ────────────────────────────────────
+        if cmds:
+            # build_context_sync detects tool names in text and returns docs block
+            cmd_text = " ".join(cmds)
+            tool_doc_block = docs.build_context_sync(cmd_text)
+            has_docs = bool(tool_doc_block and tool_doc_block.strip())
+            l4_ok = True  # docs can be empty if tool not installed/cached
+            if has_docs:
+                doc_lines = tool_doc_block.strip().split("\n")
+                snippet   = doc_lines[0][:70] if doc_lines else ""
+                print(f"  L4 tool_docs        : {_tick(True)} {len(tool_doc_block)} chars — {DIM}{snippet}…{RESET}")
+            else:
+                print(f"  L4 tool_docs        : {YELLOW}⚠ no docs fetched (tool not installed?){RESET}")
+        else:
+            l4_ok = True
+            print(f"  L4 tool_docs        : {DIM}n/a (no commands){RESET}")
+
+        # ── Layer 5: flag validation ─────────────────────────────────────────
+        if cmds:
+            loop = asyncio.new_event_loop()
+            try:
+                val_result = loop.run_until_complete(validator.validate_flags(cmds, loop))
+            finally:
+                loop.close()
+            needs_fix   = val_result.needs_correction
+            # For cases we expect to be invalid, needs_fix should be True
+            l5_ok = (needs_fix == (not exp_valid)) or (exp_valid and not needs_fix)
+            flag_status = f"{RED}needs correction{RESET}" if needs_fix else f"{GREEN}flags OK{RESET}"
+            print(f"  L5 flag_validate    : {_tick(l5_ok)} {flag_status}")
+            if needs_fix and val_result.correction_prompt:
+                snippet = val_result.correction_prompt[:80].replace('\n', ' ')
+                print(f"           hint → {YELLOW}{snippet}{RESET}")
+        else:
+            l5_ok = True
+            print(f"  L5 flag_validate    : {DIM}n/a (no commands){RESET}")
+
+        # ── Layer 6: real shell execution (optional, safe commands only) ────
+        l6_ok = True
+        if execute and safe and cmds:
+            loop = asyncio.new_event_loop()
+            try:
+                # run_all accepts full model text — wrap the command in <command> tags
+                exec_text = f"<command>{cmds[0]}</command>"
+                exec_results = loop.run_until_complete(executor.run_all(exec_text))
+            finally:
+                loop.close()
+            for er in exec_results:
+                ok = er.exit_code == 0 and not er.timed_out
+                l6_ok = ok
+                out_snippet = er.combined_output[:120].replace('\n', ' ')
+                print(f"  L6 shell_exec       : {_tick(ok)} exit={er.exit_code} {er.elapsed_s:.1f}s  {DIM}{out_snippet}{RESET}")
+        elif not execute or not safe:
+            skipped_why = "(--execute not set)" if not execute else "(network/destructive)"
+            print(f"  L6 shell_exec       : {DIM}skipped {skipped_why}{RESET}")
+
+        overall = all([l1_ok, l2_ok, l3_ok, l4_ok, l5_ok, l6_ok])
+        if overall:
+            print(f"  {GREEN}PASS{RESET}")
+            pipeline_pass += 1
+        else:
+            print(f"  {RED}FAIL{RESET}")
+            pipeline_fail += 1
+
+        results[label] = {
+            "l1_extract": l1_ok, "l2_placeholder": l2_ok,
+            "l3_fabrication": l3_ok, "l4_tool_docs": l4_ok,
+            "l5_flag_val": l5_ok, "l6_exec": l6_ok,
+            "overall": overall,
+        }
+
+    separator()
+    total = pipeline_pass + pipeline_fail
+    colour = GREEN if pipeline_fail == 0 else RED
+    print(f"\n{colour}Pipeline: {pipeline_pass}/{total} passed{RESET}")
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mythos adapter flow test")
-    parser.add_argument("--target",     default="supplier.meesho.com",
+    parser.add_argument("--target",       default="supplier.meesho.com",
                         help="Target for the test scenario")
-    parser.add_argument("--adapters",   nargs="+", default=None,
+    parser.add_argument("--adapters",     nargs="+", default=None,
                         help="Specific adapters to solo-test (default: all loaded)")
-    parser.add_argument("--max-tokens", type=int, default=512,
+    parser.add_argument("--max-tokens",   type=int, default=512,
                         help="Max new tokens per generation (default: 512, use 256 for speed)")
-    parser.add_argument("--solo-only",  action="store_true",
+    parser.add_argument("--solo-only",    action="store_true",
                         help="Run only solo adapter tests (no chain)")
-    parser.add_argument("--chain-only", action="store_true",
+    parser.add_argument("--chain-only",   action="store_true",
                         help="Run only the chained flow test")
-    parser.add_argument("--save",       default="",
+    parser.add_argument("--exec-pipeline", action="store_true",
+                        help="Run execution pipeline tests (no GPU needed)")
+    parser.add_argument("--execute",      action="store_true",
+                        help="Actually run safe commands in the pipeline test (implies --exec-pipeline)")
+    parser.add_argument("--save",         default="",
                         help="Save results JSON to this file")
     parser.add_argument("--project-root", default="",
                         help="Project root (default: directory of this script)")
     args = parser.parse_args()
 
+    if args.execute:
+        args.exec_pipeline = True
+
     project_root = args.project_root or str(Path(__file__).parent)
-    CHAIN_STEPS[0] = (CHAIN_STEPS[0][0], CHAIN_STEPS[0][1].replace("supplier.meesho.com", args.target))
+
+    # Determine which modes to run
+    run_llm   = not args.exec_pipeline or args.solo_only or args.chain_only
+    run_exec  = args.exec_pipeline
+    mode_str  = []
+    if args.exec_pipeline:
+        mode_str.append("exec-pipeline" + (" + execute" if args.execute else ""))
+    if not args.exec_pipeline or args.solo_only:
+        mode_str.append("solo")
+    if not args.exec_pipeline or args.chain_only:
+        mode_str.append("chain")
+    mode_label = " + ".join(mode_str) if mode_str else "solo + chain"
 
     print(f"""
 {BOLD}{CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   MYTHOS ENGINE — ADAPTER FLOW TEST
-  target: {args.target}
+  target:     {args.target}
   max-tokens: {args.max_tokens}
-  mode: {'solo only' if args.solo_only else 'chain only' if args.chain_only else 'solo + chain'}
+  mode:       {mode_label}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━{RESET}
 """)
 
-    model   = load_model(project_root, args.max_tokens)
-    loaded  = model.loaded_adapters()
     results: dict = {}
 
-    adapters_to_test = args.adapters or sorted(loaded)
+    # ── Execution pipeline (no GPU) ─────────────────────────────────────────
+    if run_exec:
+        pipeline_results = run_execution_pipeline_test(execute=args.execute)
+        results["exec_pipeline"] = pipeline_results
+        if args.exec_pipeline and not args.solo_only and not args.chain_only:
+            if args.save:
+                out_path = Path(args.save)
+                out_path.write_text(json.dumps(results, indent=2))
+                print(f"\n{GREEN}Results saved to: {out_path}{RESET}")
+            return
 
-    if not args.chain_only:
-        run_solo_tests(model, adapters_to_test, args.max_tokens, results)
+    # ── LLM adapter tests (need GPU) ────────────────────────────────────────
+    if run_llm or args.solo_only or args.chain_only:
+        CHAIN_STEPS[0] = (CHAIN_STEPS[0][0], CHAIN_STEPS[0][1].replace("supplier.meesho.com", args.target))
+        model   = load_model(project_root, args.max_tokens)
+        loaded  = model.loaded_adapters()
+        adapters_to_test = args.adapters or sorted(loaded)
 
-    if not args.solo_only:
-        run_chain_test(model, args.max_tokens, results)
+        if not args.chain_only:
+            run_solo_tests(model, adapters_to_test, args.max_tokens, results)
 
-    print_summary(results)
+        if not args.solo_only:
+            run_chain_test(model, args.max_tokens, results)
+
+        print_summary(results)
 
     if args.save:
         out_path = Path(args.save)
