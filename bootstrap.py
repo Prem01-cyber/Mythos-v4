@@ -32,14 +32,19 @@ STATE_FILE   = Path.home() / ".mythosengine" / "state.json"
 # ── Adapter registry ─────────────────────────────────────────────────────────
 # (name, relative-path-candidate-1, relative-path-candidate-2, HF repo ID)
 ADAPTER_SPECS = [
-    ("htb",      "adapters/mythos-v4-htb/best-adapter",      "outputs_new/mythos-v4-htb/best-adapter",      ""),
-    ("vulhub",   "adapters/mythos-v4-vulhub/best-adapter",   "outputs_new/mythos-v4-vulhub/best-adapter",   ""),
-    ("attack",   "adapters/mythos-v4-attack/best-adapter",   "outputs_new/mythos-v4-attack/best-adapter",   ""),
-    ("exploitdb","adapters/mythos-v4-exploitdb/best-adapter","outputs_new/mythos-v4-exploitdb/best-adapter",""),
-    ("ad",       "adapters/mythos-v4-ad/best-adapter",       "outputs_new/mythos-v4-ad/best-adapter",       ""),
-    ("webapp",   "adapters/mythos-v4-webapp/best-adapter",   "outputs_new/mythos-v4-webapp/best-adapter",   ""),
-    ("osint",    "adapters/mythos-v4-osint/best-adapter",    "outputs_new/mythos-v4-osint/best-adapter",    ""),
-    ("cloud",    "adapters/mythos-v4-cloud/best-adapter",    "outputs_new/mythos-v4-cloud/best-adapter",    ""),
+    ("htb",       "adapters/mythos-v4-htb/best-adapter",       "outputs_new/mythos-v4-htb/best-adapter",       ""),
+    ("vulhub",    "adapters/mythos-v4-vulhub/best-adapter",    "outputs_new/mythos-v4-vulhub/best-adapter",    ""),
+    ("attack",    "adapters/mythos-v4-attack/best-adapter",    "outputs_new/mythos-v4-attack/best-adapter",    ""),
+    ("exploitdb", "adapters/mythos-v4-exploitdb/best-adapter", "outputs_new/mythos-v4-exploitdb/best-adapter", ""),
+    ("ad",        "adapters/mythos-v4-ad/best-adapter",        "outputs_new/mythos-v4-ad/best-adapter",        ""),
+    ("webapp",    "adapters/mythos-v4-webapp/best-adapter",    "outputs_new/mythos-v4-webapp/best-adapter",    ""),
+    ("osint",     "adapters/mythos-v4-osint/best-adapter",     "outputs_new/mythos-v4-osint/best-adapter",     ""),
+    ("cloud",     "adapters/mythos-v4-cloud/best-adapter",     "outputs_new/mythos-v4-cloud/best-adapter",     ""),
+    # New adapters (trained separately — orchestration / reasoning layer)
+    ("executor",  "adapters/mythos-v4-executor/best-adapter",  "outputs_new/mythos-v4-executor/best-adapter",  ""),
+    ("analyst",   "adapters/mythos-v4-analyst/best-adapter",   "outputs_new/mythos-v4-analyst/best-adapter",   ""),
+    ("planner",   "adapters/mythos-v4-planner/best-adapter",   "outputs_new/mythos-v4-planner/best-adapter",   ""),
+    ("researcher","adapters/mythos-v4-researcher/best-adapter","outputs_new/mythos-v4-researcher/best-adapter",""),
 ]
 
 # ── Tools expected by the engine ─────────────────────────────────────────────
