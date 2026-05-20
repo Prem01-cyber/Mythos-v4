@@ -747,75 +747,31 @@ def main() -> None:
         else:
             print("  H1 API not accessible — generating all examples synthetically")
 
-        # Batch generate H1 examples (much faster)
-        print(f"  Generating {needed} examples in batches of {BATCH_SIZE}...")
-        for batch_start in tqdm(range(0, needed, BATCH_SIZE), desc="h1-batches"):
-            batch_size = min(BATCH_SIZE, needed - batch_start)
-            
-            # Generate batch of prompts
-            prompts = []
-            contexts = []
-            for _ in range(batch_size):
-                vuln_type   = random.choice(VULN_TYPES)
-                severity    = random.choices(SEVERITIES, weights=SEVERITY_WEIGHTS)[0]
-                target_type = random.choice(TARGET_TYPES)
-                prompt = SYNTH_H1_REPORT_PROMPT.format(
-                    vuln_type=vuln_type, severity=severity, target_type=target_type
-                )
-                prompts.append(prompt)
-                contexts.append((vuln_type, severity))
-            
-            # Batch GPT call
-            responses = _gpt_batch(prompts, max_tokens=1800)
-            
-            # Process batch results
-            batch_examples = []
-            for raw, (vuln_type, severity) in zip(responses, contexts):
-                if not raw:
-                    continue
-                try:
-                    data = _parse_json_obj(raw)
-                    if not all(k in data for k in ("title", "summary")):
-                        continue
-                    summary = data.get("summary", "")
-                    if not isinstance(summary, str):
-                        summary = str(summary) if summary else ""
-                    fields = {
-                        "title":     data.get("title", ""),
-                        "severity":  data.get("severity", severity),
-                        "vuln_type": data.get("vuln_type", vuln_type),
-                        "weakness":  data.get("weakness", ""),
-                        "summary":   summary[:2000],
-                    }
-                    ex = build_h1_training_example(fields)
-                    if ex:
-                        batch_examples.append(ex)
-                except Exception:
-                    continue
-            
-            # Write batch
-            total_written += append_jsonl(args.out_h1, batch_examples)
+        def _h1_one(_: int) -> dict | None:
+            return generate_one_h1_example()
+
+        print(f"  Generating {needed} examples with {MAX_WORKERS} parallel workers...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futs = list(tqdm(executor.map(_h1_one, range(needed)),
+                             total=needed, desc="h1-examples"))
+        batch_examples = [ex for ex in futs if ex]
+        total_written += append_jsonl(args.out_h1, batch_examples)
+        print(f"  Written {len(batch_examples)} H1 examples")
 
     if args.type in ("synth", "both"):
         existing = count_written(args.out_synth)
         needed   = TARGET_SYNTH - existing
         print(f"\n[B] Synth examples: {existing}/{TARGET_SYNTH}")
 
-        # Batch generate synth examples  
-        print(f"  Generating {needed} examples in batches of {BATCH_SIZE}...")
-        for batch_start in tqdm(range(0, needed, BATCH_SIZE), desc="synth-batches"):
-            batch_size = min(BATCH_SIZE, needed - batch_start)
-            
-            # Process batch
-            batch_examples = []
-            for _ in range(batch_size):
-                scenario = random.choice(SYNTH_SCENARIOS)
-                ex = generate_synth_chain(scenario)
-                if ex:
-                    batch_examples.append(ex)
-            
-            # Write batch
-            total_written += append_jsonl(args.out_synth, batch_examples)
+        def _synth_one(_: int) -> dict | None:
+            return generate_synth_chain(random.choice(SYNTH_SCENARIOS))
+
+        print(f"  Generating {needed} examples with {MAX_WORKERS} parallel workers...")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futs = list(executor.map(_synth_one, range(needed)))
+        batch_examples = [ex for ex in futs if ex]
+        total_written += append_jsonl(args.out_synth, batch_examples)
+        print(f"  Written {len(batch_examples)} synth examples")
 
     print(f"\nWrote {total_written} new examples total")
     print(f"  H1    : {args.out_h1}")
