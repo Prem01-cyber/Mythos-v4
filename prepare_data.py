@@ -212,6 +212,11 @@ def process_source(
             skipped += 1
             continue
 
+        # Add metadata with source label
+        if "metadata" not in result:
+            result["metadata"] = {}
+        result["metadata"]["source"] = source_label
+
         ta = _count_example(result)
         tokens_after.append(ta)
         if ta < tb:
