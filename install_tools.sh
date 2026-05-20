@@ -219,19 +219,41 @@ fi
 # ── 6. HTTP probing & fingerprinting ─────────────────────────────────────────
 header "HTTP Probing & Fingerprinting"
 
-# Install projectdiscovery/httpx as 'httpx' in system bin dir.
-# This MUST shadow the Python httpx (venv bin / user local bin) — the model
-# is trained on projectdiscovery/httpx flags (-l, -status-code, -title, -tech).
-# If Go httpx is already at /usr/local/bin/httpx, skip; otherwise install.
-if [[ "$(command -v httpx 2>/dev/null)" == *".venv"* ]] || [[ "$(command -v httpx 2>/dev/null)" == *"site-packages"* ]] || ! command -v httpx &>/dev/null; then
-    install_go_tool "httpx" "github.com/projectdiscovery/httpx/cmd/httpx@latest"
-    # Move to INSTALL_DIR to ensure it shadows the Python binary
-    if [[ -f "${HOME}/go/bin/httpx" ]] && [[ -w "${INSTALL_DIR}" ]]; then
-        cp "${HOME}/go/bin/httpx" "${INSTALL_DIR}/httpx"
-        success "Copied projectdiscovery/httpx to ${INSTALL_DIR}/httpx (shadows Python httpx)"
+# Install projectdiscovery/httpx as the system 'httpx'.
+# The model expects projectdiscovery flags (-l, -status-code, -title, -tech).
+# Strategy:
+#   1. Rename any Python httpx in venv to 'httpx-py' so it can no longer shadow.
+#   2. Always run go install and copy to INSTALL_DIR (/usr/local/bin).
+#   This is safe: 'httpx-py <URL>' still works for users who need the Python client.
+
+# Step 1: rename Python httpx binaries in venvs so they can't shadow
+for _venv_httpx in \
+    "/workspace/Mythos-v4/.venv/bin/httpx" \
+    "${HOME}/.venv/bin/httpx" \
+    "${HOME}/.local/bin/httpx"; do
+    if [[ -f "$_venv_httpx" ]] && [[ "$_venv_httpx" != *"/go/"* ]]; then
+        # Check it is the Python client (not a Go binary)
+        if "$_venv_httpx" --help 2>&1 | grep -q "Missing argument 'URL'"; then
+            mv "$_venv_httpx" "${_venv_httpx}-py"
+            warn "Renamed Python httpx → ${_venv_httpx}-py (was shadowing projectdiscovery/httpx)"
+        fi
+    fi
+done
+
+# Step 2: install projectdiscovery/httpx via go and copy to system bin
+info "Installing projectdiscovery/httpx (Go scanner)..."
+if go install github.com/projectdiscovery/httpx/cmd/httpx@latest 2>/dev/null; then
+    _go_httpx="${HOME}/go/bin/httpx"
+    [[ ! -f "$_go_httpx" ]] && _go_httpx="$(go env GOPATH)/bin/httpx"
+    if [[ -f "$_go_httpx" ]]; then
+        cp "$_go_httpx" "${INSTALL_DIR}/httpx"
+        chmod +x "${INSTALL_DIR}/httpx"
+        success "projectdiscovery/httpx installed → ${INSTALL_DIR}/httpx"
+    else
+        warn "go install succeeded but binary not found at ${_go_httpx}"
     fi
 else
-    success "httpx (projectdiscovery — already installed at $(command -v httpx))"
+    warn "projectdiscovery/httpx go install failed — will use curl fallback"
 fi
 install_go_tool "katana"   "github.com/projectdiscovery/katana/cmd/katana@latest"
 install_go_tool "waybackurls" "github.com/tomnomnom/waybackurls@latest"
