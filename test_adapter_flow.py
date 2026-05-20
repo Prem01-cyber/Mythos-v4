@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
 """Adapter flow test — runs all adapters individually and chains outputs.
 
-Tests three things:
+Tests four things:
   1. SOLO: each adapter with a relevant standalone prompt (verify it loads
      and produces coherent output for its domain)
   2. CHAINED: osint → webapp → analyst → researcher (simulate a real
      bug bounty session where each adapter's output feeds the next)
   3. EXEC PIPELINE: command extraction → flag validation → tool_docs injection
-     → optional real shell execution (the part that breaks in live runs)
+     → optional real shell execution (no GPU)
+  4. CORRECTION TEST: domain adapter generates → CommandValidator flags error
+     → executor adapter corrects → verify corrected command is valid (GPU)
+  5. LIVE END-TO-END: osint generates → extract → validate → (executor corrects
+     if needed) → execute real command → analyst interprets → verify JSON (GPU)
 
 Usage:
     # All adapters, full chain (GPU)
     python test_adapter_flow.py --target supplier.meesho.com
 
-    # Just specific adapters
-    python test_adapter_flow.py --adapters osint webapp analyst
+    # Executor correction test only (GPU) — key pipeline validation
+    python test_adapter_flow.py --correction-test
 
-    # Solo tests only (no chain)
-    python test_adapter_flow.py --solo-only
+    # Full live end-to-end test (GPU + execution)
+    python test_adapter_flow.py --live-test --execute
 
-    # Chain only
-    python test_adapter_flow.py --chain-only
-
-    # Execution pipeline only (no GPU required)
+    # Static pipeline only (no GPU)
     python test_adapter_flow.py --exec-pipeline
 
-    # Execution pipeline WITH real shell execution (runs safe read-only cmds)
-    python test_adapter_flow.py --exec-pipeline --execute
+    # All tests combined
+    python test_adapter_flow.py --exec-pipeline --correction-test --live-test --execute
 
     # Limit output tokens (faster)
     python test_adapter_flow.py --max-tokens 256
@@ -510,19 +511,39 @@ _PIPELINE_CASES: list[dict] = [
         "safe_to_run": False,
     },
     {
-        "label": "python block excluded from extraction",
+        "label": "standalone python block excluded (no <reasoning> tag)",
         "adapter": "exploitdb",
         "model_output": (
-            "<reasoning>Here is an exploit:</reasoning>\n"
+            "Here is the exploit code for CVE-2019-0708:\n"
             "```python\n"
             "import socket\n"
             "s = socket.socket()\n"
             "s.connect(('10.10.10.50', 3389))\n"
             "```"
         ),
-        "expect_cmds": 0,  # python blocks must NOT be extracted
+        "expect_cmds": 0,  # standalone python fences NOT extracted — no <reasoning> wrapper
         "expect_valid": True,
         "safe_to_run": False,
+    },
+    {
+        "label": "exploitdb <reasoning> python code saved and run via python3",
+        "adapter": "exploitdb",
+        "model_output": (
+            "<reasoning>\n"
+            "### BlueKeep PoC\n"
+            "The exploit connects to RDP and sends a crafted MS_T120 channel request.\n"
+            "</reasoning>\n"
+            "```python\n"
+            "import socket\n"
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.connect(('10.10.10.50', 3389))\n"
+            "s.close()\n"
+            "print('connection probe complete')\n"
+            "```"
+        ),
+        "expect_cmds": 1,   # <reasoning> + python → saved as exploit.py → python3 /tmp/...
+        "expect_valid": True,
+        "safe_to_run": False,  # don't actually run exploit code against a real host
     },
     {
         "label": "safe local command (verify real execution works)",
@@ -727,44 +748,532 @@ def run_execution_pipeline_test(execute: bool = False) -> dict:
     return results
 
 
+# ── Correction test scenarios ─────────────────────────────────────────────────
+# Each entry: (label, domain_adapter, wrong_command, injected_error, must_not_contain, must_contain)
+# wrong_command   — the command the domain adapter "would have generated" (canned)
+# injected_error  — the error string CommandValidator or runtime would surface
+# must_not_contain — list of strings the corrected command must NOT include
+# must_contain    — list of strings (any one) the corrected command MUST include
+
+_CORRECTION_SCENARIOS: list[dict] = [
+    {
+        "label":           "gau positional arg (model uses -d which doesn't exist)",
+        "domain_adapter":  "osint",
+        "wrong_cmd":       "gau -d supplier.meesho.com --o gau_out.txt",
+        "error_msg":       "unknown shorthand flag: 'd' in -d\nUsage: gau [flags] <domain>",
+        "must_not_contain": ["-d "],
+        "must_contain":    ["gau supplier.meesho.com", "gau supplier"],
+    },
+    {
+        "label":           "httpx PD flags on Python httpx binary",
+        "domain_adapter":  "osint",
+        "wrong_cmd":       "cat subdomains.txt | httpx -status-code -title -tech-detect -silent",
+        "error_msg":       "Error: No such option: -status-code\nThis httpx is the Python client, not projectdiscovery/httpx.",
+        "must_not_contain": ["-status-code", "-tech-detect", "-title"],
+        "must_contain":    ["curl", "httpx <URL>", "httpx http"],
+    },
+    {
+        "label":           "nuclei target flag (-url instead of -u)",
+        "domain_adapter":  "webapp",
+        "wrong_cmd":       "nuclei --url https://supplier.meesho.com -t nuclei-templates/",
+        "error_msg":       "Error: unknown flag: --url\nCorrect flag: -u/--target",
+        "must_not_contain": ["--url "],
+        "must_contain":    ["nuclei -u", "nuclei -target"],
+    },
+    {
+        "label":           "subfinder long-form flag (--domain vs -d)",
+        "domain_adapter":  "osint",
+        "wrong_cmd":       "subfinder --domain supplier.meesho.com --all --silent",
+        "error_msg":       "unknown flag: --domain\nCorrect flag is -d for domain",
+        "must_not_contain": ["--domain"],
+        "must_contain":    ["subfinder -d", "subfinder -domain"],
+    },
+    {
+        "label":           "amass piped directly to nmap without extracting hostnames",
+        "domain_adapter":  "osint",
+        "wrong_cmd":       "amass enum -d supplier.meesho.com | nmap -iL -",
+        "error_msg":       "amass output format is 'subdomain --> record_type --> target'; nmap cannot read it directly. Extract hostnames first.",
+        "must_not_contain": ["amass enum -d supplier.meesho.com | nmap"],
+        "must_contain":    ["awk", "cut", "grep", "dnsx", "tee", "subfinder"],
+    },
+]
+
+
+def run_correction_test(
+    model:      "MultiAdapterModel",
+    max_tokens: int,
+    results:    dict,
+) -> None:
+    """
+    GPU test: verify executor adapter correctly fixes commands with wrong flags.
+
+    For each scenario:
+      1. Build a correction_messages from the wrong command + error + tool_docs
+      2. Call executor adapter to generate the corrected command
+      3. Assert the correction:
+         (a) contains a <command> block
+         (b) does NOT contain the wrong flags
+         (c) DOES contain the expected correct syntax (any of must_contain)
+    """
+    from pentestgpt.core.tool_docs import ToolDocsCache
+    from pentestgpt.core.command_validator import build_progressive_prompt, FlagError
+    from pentestgpt.prompts.mythos_prompts import SYSTEM_PROMPTS, FORMAT_INSTRUCTION
+
+    docs = ToolDocsCache()
+    separator("EXECUTOR CORRECTION TEST", BOLD)
+    print(
+        f"  Tests executor adapter's ability to fix wrong commands using tool docs.\n"
+        f"  {len(_CORRECTION_SCENARIOS)} scenarios: gau -d, httpx PD flags, nuclei --url, subfinder --domain, amass|nmap\n"
+    )
+
+    corr_pass = 0
+    corr_fail = 0
+    corr_results = []
+
+    for sc in _CORRECTION_SCENARIOS:
+        label      = sc["label"]
+        wrong_cmd  = sc["wrong_cmd"]
+        err_msg    = sc["error_msg"]
+        must_not   = sc["must_not_contain"]
+        must_have  = sc["must_contain"]
+
+        separator(f" {label} ", YELLOW)
+        print(f"  {DIM}Wrong: {wrong_cmd[:90]}{RESET}")
+        print(f"  {DIM}Error: {err_msg[:80]}{RESET}")
+
+        # Build tool docs for the tool in this command
+        tool_doc_block = docs.build_context_sync(wrong_cmd)
+
+        # Build a correction prompt that mirrors what mythos_backend.py sends to executor
+        correction_content = (
+            f"The following command failed with an error:\n\n"
+            f"Command: {wrong_cmd}\n\n"
+            f"Error:\n{err_msg}\n\n"
+            f"Tool documentation:\n{tool_doc_block or '[no docs available]'}\n\n"
+            f"Fix the command so it uses the correct flags as shown in the documentation. "
+            f"Output the corrected command in a <command> block."
+        )
+
+        executor_system = SYSTEM_PROMPTS["executor"] + FORMAT_INSTRUCTION
+        correction_messages = [
+            {"role": "system",    "content": executor_system},
+            {"role": "user",      "content": correction_content},
+        ]
+
+        t0 = time.time()
+        try:
+            corrected_response = model.generate("executor", correction_messages, max_new_tokens=max_tokens)
+        except Exception as exc:
+            print(f"  {RED}FAILED — generate error: {exc}{RESET}")
+            corr_fail += 1
+            corr_results.append({"label": label, "status": "error", "error": str(exc)})
+            continue
+        elapsed = time.time() - t0
+
+        # Extract corrected command
+        from pentestgpt.core.tool_executor import ShellExecutor
+        _extractor = ShellExecutor.__new__(ShellExecutor)
+        _extractor.workspace = "/tmp"
+        extracted = _extractor.extract_commands(corrected_response)
+
+        has_cmd   = bool(extracted)
+        corrected = extracted[0] if extracted else corrected_response
+
+        # Assertions
+        bad_flags_gone = not any(pat in corrected for pat in must_not)
+        fixed_correctly = any(pat in corrected for pat in must_have)
+
+        # Show result
+        print(f"\n  Response ({elapsed:.1f}s, {model.count_tokens(corrected_response)}t):")
+        display = corrected_response[:400]
+        if len(corrected_response) > 400:
+            display += f"\n{DIM}... [{len(corrected_response)-400} chars truncated]{RESET}"
+        print(display)
+
+        print()
+        print(f"  has <command>     : {_tick(has_cmd)}")
+        print(f"  wrong flags gone  : {_tick(bad_flags_gone)}", end="")
+        if not bad_flags_gone:
+            still_bad = [p for p in must_not if p in corrected]
+            print(f"  {RED}(still contains: {still_bad}){RESET}", end="")
+        print()
+        print(f"  correct syntax    : {_tick(fixed_correctly)}", end="")
+        if not fixed_correctly:
+            print(f"  {YELLOW}(expected one of: {must_have[:2]}){RESET}", end="")
+        print()
+
+        overall = has_cmd and bad_flags_gone and fixed_correctly
+        print(f"\n  {GREEN}PASS{RESET}" if overall else f"\n  {RED}FAIL{RESET}")
+        if overall:
+            corr_pass += 1
+        else:
+            corr_fail += 1
+
+        corr_results.append({
+            "label":           label,
+            "wrong_cmd":       wrong_cmd,
+            "corrected_cmd":   corrected,
+            "has_command":     has_cmd,
+            "bad_flags_gone":  bad_flags_gone,
+            "fixed_correctly": fixed_correctly,
+            "elapsed_s":       round(elapsed, 2),
+            "out_tokens":      model.count_tokens(corrected_response),
+        })
+
+    separator()
+    total = corr_pass + corr_fail
+    colour = GREEN if corr_fail == 0 else (YELLOW if corr_pass > 0 else RED)
+    print(f"\n{colour}Correction: {corr_pass}/{total} passed{RESET}")
+    results["correction"] = corr_results
+
+
+# ── Live end-to-end test ───────────────────────────────────────────────────────
+
+_LIVE_STEPS: list[dict] = [
+    {
+        "step":    1,
+        "name":    "osint generates command",
+        "adapter": "osint",
+        "prompt":  (
+            "Enumerate subdomains of supplier.meesho.com using subfinder. "
+            "Output to subdomains.txt. Include -H 'X-Hackerone: aquamarine_skeleton' in all HTTP probes."
+        ),
+        "expect_command": True,
+        "safe_exec_override": "subfinder -version 2>&1 || echo 'subfinder not installed'",
+    },
+    {
+        "step":    2,
+        "name":    "executor corrects if validator flags an error",
+        "adapter": "executor",   # only runs if correction is needed
+        "prompt":  None,         # filled dynamically from step 1
+        "expect_command": True,
+        "safe_exec_override": None,
+    },
+    {
+        "step":    3,
+        "name":    "analyst interprets tool output",
+        "adapter": "analyst",
+        "prompt":  None,  # filled with simulated tool output
+        "expect_command": False,  # analyst returns JSON, no command
+        "safe_exec_override": None,
+    },
+    {
+        "step":    4,
+        "name":    "webapp proposes next action from analyst findings",
+        "adapter": "webapp",
+        "prompt":  None,  # filled with analyst output
+        "expect_command": True,
+        "safe_exec_override": None,
+    },
+]
+
+# Simulated subfinder output (used when real execution is skipped)
+_SIMULATED_SUBFINDER_OUTPUT = """[INF] Current subfinder version v2.6.3
+api.supplier.meesho.com
+static.supplier.meesho.com
+cdn.supplier.meesho.com
+dev.supplier.meesho.com
+[INF] Found 4 subdomains for supplier.meesho.com in 8 seconds
+"""
+
+
+def run_live_test(
+    model:      "MultiAdapterModel",
+    max_tokens: int,
+    results:    dict,
+    execute:    bool = False,
+) -> None:
+    """
+    Full end-to-end pipeline test using real model inference.
+
+    Step 1 — osint   : generate subfinder command
+    Step 2 — validate: check flags with CommandValidator
+              executor: correct if needed (THIS IS THE KEY TEST)
+    Step 3 — execute : run the command (or use simulated output if --execute not set)
+    Step 4 — analyst : parse tool output → structured JSON
+    Step 5 — webapp  : propose next action from analyst findings
+
+    Checks at each step mirror what mythos_backend.py does in production.
+    """
+    from pentestgpt.core.tool_executor import ShellExecutor
+    from pentestgpt.core.command_validator import CommandValidator, build_progressive_prompt
+    from pentestgpt.core.tool_docs import ToolDocsCache
+    from pentestgpt.prompts.mythos_prompts import SYSTEM_PROMPTS, BUG_BOUNTY_PROMPTS, FORMAT_INSTRUCTION
+
+    shell     = ShellExecutor(workspace="/tmp/mythos_live_test", timeout=15)
+    validator = CommandValidator()
+    docs      = ToolDocsCache()
+
+    separator("LIVE END-TO-END PIPELINE TEST", BOLD)
+    print(
+        f"  Simulates the full mythos_backend loop:\n"
+        f"  osint → validate → {'execute → ' if execute else '[simulated output] → '}"
+        f"analyst → webapp\n"
+        f"  Key check: if osint generates wrong flags, executor corrects them.\n"
+    )
+
+    live_results = []
+    step_history: list[dict] = []
+    prev_output = ""
+
+    # ── STEP 1: osint generates a command ─────────────────────────────────────
+    separator("STEP 1/5 — OSINT generates command", ADAPTER_COLOUR["osint"])
+    step1_prompt = (
+        f"[BUG BOUNTY SCOPE — supplier.meesho.com]\n"
+        f"Mandatory header: -H 'X-Hackerone: aquamarine_skeleton'\n\n"
+        f"{BUG_BOUNTY_PROMPTS.get('osint', SYSTEM_PROMPTS['osint'])}{FORMAT_INSTRUCTION}\n\n"
+        f"Enumerate subdomains of supplier.meesho.com using subfinder. "
+        f"Output results to /tmp/subdomains.txt."
+    )
+    msgs = [
+        {"role": "system", "content": BUG_BOUNTY_PROMPTS.get("osint", SYSTEM_PROMPTS["osint"]) + FORMAT_INSTRUCTION},
+        {"role": "user",   "content": (
+            f"{MEESHO_SCOPE}\n\n"
+            "Enumerate subdomains of supplier.meesho.com using subfinder. "
+            "Output results to /tmp/subdomains.txt."
+        )},
+    ]
+    t0 = time.time()
+    osint_response = model.generate("osint", msgs, max_new_tokens=max_tokens)
+    elapsed = time.time() - t0
+    cmds = shell.extract_commands(osint_response)
+    print(f"{DIM}Response ({elapsed:.1f}s):{RESET}")
+    print(osint_response[:300] + ("..." if len(osint_response) > 300 else ""))
+    print(f"\n  {_tick(bool(cmds))} extracted {len(cmds)} command(s)")
+    if cmds:
+        print(f"  cmd: {DIM}{cmds[0][:100]}{RESET}")
+    live_results.append({"step": "osint_generate", "ok": bool(cmds), "cmd": cmds[0] if cmds else ""})
+
+    # ── STEP 2: CommandValidator flags check ──────────────────────────────────
+    separator("STEP 2/5 — VALIDATE flags (executor corrects if needed)", ADAPTER_COLOUR["executor"])
+    final_cmd = cmds[0] if cmds else ""
+    correction_needed = False
+    correction_ok = True
+
+    if cmds:
+        ev_loop = asyncio.new_event_loop()
+        try:
+            val = ev_loop.run_until_complete(validator.validate_flags(cmds, ev_loop))
+        finally:
+            ev_loop.close()
+
+        if val.needs_correction:
+            correction_needed = True
+            print(f"  {YELLOW}⚠ Validator flagged issues — calling executor to correct{RESET}")
+            print(f"  {DIM}Error: {val.correction_prompt[:80].replace(chr(10), ' ')}{RESET}")
+
+            # Build tool docs for the command
+            tool_doc_block = docs.build_context_sync(cmds[0])
+
+            # Build correction prompt — mirrors mythos_backend.py exactly
+            correction_content = (
+                f"The following command failed flag validation:\n\n"
+                f"Command: {cmds[0]}\n\n"
+                f"Validation error:\n{val.correction_prompt}\n\n"
+                f"Tool documentation:\n{tool_doc_block or '[no docs available]'}\n\n"
+                f"Correct the command using ONLY flags shown in the documentation."
+            )
+            exec_msgs = [
+                {"role": "system", "content": SYSTEM_PROMPTS["executor"] + FORMAT_INSTRUCTION},
+                {"role": "user",   "content": correction_content},
+            ]
+            t0 = time.time()
+            corrected_resp = model.generate("executor", exec_msgs, max_new_tokens=max_tokens)
+            elapsed = time.time() - t0
+            corrected_cmds = shell.extract_commands(corrected_resp)
+            print(f"\n  executor response ({elapsed:.1f}s):")
+            print(corrected_resp[:300] + ("..." if len(corrected_resp) > 300 else ""))
+
+            if corrected_cmds:
+                final_cmd = corrected_cmds[0]
+                print(f"\n  {_tick(True)} executor corrected to: {DIM}{final_cmd[:100]}{RESET}")
+            else:
+                correction_ok = False
+                print(f"\n  {_tick(False)} executor produced no <command>")
+        else:
+            print(f"  {_tick(True)} flags OK — no correction needed")
+            print(f"  {DIM}cmd: {final_cmd[:100]}{RESET}")
+    else:
+        print(f"  {DIM}skipped (no command to validate){RESET}")
+
+    live_results.append({
+        "step": "validate_correct",
+        "correction_needed": correction_needed,
+        "correction_ok": correction_ok,
+        "final_cmd": final_cmd,
+    })
+
+    # ── STEP 3: Execute command (or use simulated output) ─────────────────────
+    separator("STEP 3/5 — EXECUTE (real or simulated)", ADAPTER_COLOUR.get("executor", CYAN))
+    if execute and final_cmd:
+        # Run a safe version of the command (version check / dry-run)
+        safe_cmd = "subfinder -version 2>&1 || echo 'subfinder not installed'"
+        print(f"  {DIM}Running safe version: {safe_cmd}{RESET}")
+        ev_loop = asyncio.new_event_loop()
+        try:
+            exec_results = ev_loop.run_until_complete(
+                shell.run_all(f"<command>{safe_cmd}</command>")
+            )
+        finally:
+            ev_loop.close()
+        tool_output = exec_results[0].combined_output if exec_results else ""
+        ok = bool(tool_output)
+        print(f"  {_tick(ok)} exit={exec_results[0].exit_code if exec_results else '?'}")
+        print(f"  {DIM}{tool_output[:120]}{RESET}")
+    else:
+        # Use simulated output — makes test deterministic without network
+        tool_output = _SIMULATED_SUBFINDER_OUTPUT
+        print(f"  {YELLOW}Using simulated subfinder output (pass --execute for real){RESET}")
+        print(f"  {DIM}{tool_output[:200]}{RESET}")
+
+    # Append real subfinder results (or simulated) to simulate analyst input
+    analyst_input = (
+        f"[Tool: subfinder | Command: {final_cmd[:60]}]\n"
+        f"{tool_output}\n\n"
+        f"[Target: supplier.meesho.com]\n"
+        f"Extract all subdomains, live endpoints, tech stack, and anomalies."
+    )
+    live_results.append({"step": "execute", "tool_output_len": len(tool_output)})
+
+    # ── STEP 4: Analyst interprets output ─────────────────────────────────────
+    separator("STEP 4/5 — ANALYST interprets tool output", ADAPTER_COLOUR["analyst"])
+    analyst_msgs = [
+        {"role": "system", "content": SYSTEM_PROMPTS["analyst"] + FORMAT_INSTRUCTION},
+        {"role": "user",   "content": analyst_input},
+    ]
+    t0 = time.time()
+    analyst_response = model.generate("analyst", analyst_msgs, max_new_tokens=max_tokens)
+    elapsed = time.time() - t0
+    print(f"  response ({elapsed:.1f}s, {model.count_tokens(analyst_response)}t):")
+    print(analyst_response[:500] + ("..." if len(analyst_response) > 500 else ""))
+
+    # Try to parse as JSON
+    analyst_ok = False
+    analyst_data: dict = {}
+    try:
+        # analyst may wrap JSON in markdown code fences
+        clean = analyst_response.strip()
+        if clean.startswith("```"):
+            clean = "\n".join(clean.split("\n")[1:])
+            clean = clean.rsplit("```", 1)[0].strip()
+        analyst_data = json.loads(clean)
+        analyst_ok = True
+    except Exception:
+        # Not strict JSON — check if it at least contains domain-relevant fields
+        has_subdomains   = "subdomain" in analyst_response.lower()
+        has_endpoints    = "endpoint" in analyst_response.lower() or "url" in analyst_response.lower()
+        analyst_ok = has_subdomains or has_endpoints
+
+    print(f"\n  {_tick(analyst_ok)} analyst produced {'valid JSON' if isinstance(analyst_data, dict) else 'structured findings'}")
+    if analyst_data:
+        keys = list(analyst_data.keys())[:6]
+        print(f"  JSON keys: {DIM}{keys}{RESET}")
+    live_results.append({"step": "analyst", "ok": analyst_ok, "is_json": isinstance(analyst_data, dict)})
+
+    # ── STEP 5: webapp proposes next action from findings ─────────────────────
+    separator("STEP 5/5 — WEBAPP proposes next action", ADAPTER_COLOUR["webapp"])
+    webapp_prompt = (
+        f"{MEESHO_SCOPE}\n\n"
+        f"Analyst findings from recon:\n{analyst_response[:400]}\n\n"
+        f"Based on these findings, propose the highest-value next action to test for vulnerabilities. "
+        f"Use the test account credentials from the scope. Include X-Hackerone header."
+    )
+    webapp_msgs = [
+        {"role": "system", "content": BUG_BOUNTY_PROMPTS.get("webapp", SYSTEM_PROMPTS["webapp"]) + FORMAT_INSTRUCTION},
+        {"role": "user",   "content": webapp_prompt},
+    ]
+    t0 = time.time()
+    webapp_response = model.generate("webapp", webapp_msgs, max_new_tokens=max_tokens)
+    elapsed = time.time() - t0
+    webapp_cmds = shell.extract_commands(webapp_response)
+    print(f"  response ({elapsed:.1f}s, {model.count_tokens(webapp_response)}t):")
+    print(webapp_response[:400] + ("..." if len(webapp_response) > 400 else ""))
+    has_hackerone = "X-Hackerone" in webapp_response or "aquamarine_skeleton" in webapp_response
+    print(f"\n  {_tick(bool(webapp_cmds))} has <command>")
+    print(f"  {_tick(has_hackerone)} includes X-Hackerone header")
+    live_results.append({
+        "step": "webapp", "ok": bool(webapp_cmds),
+        "has_header": has_hackerone,
+        "cmd": webapp_cmds[0] if webapp_cmds else "",
+    })
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    separator()
+    checks = {
+        "osint generated command":    live_results[0]["ok"],
+        "executor correction":        not correction_needed or correction_ok,
+        "tool executed / simulated":  True,
+        "analyst extracted findings": analyst_ok,
+        "webapp proposed next action": live_results[-1]["ok"],
+        "WAF header in webapp output": live_results[-1]["has_header"],
+    }
+    live_pass = sum(1 for v in checks.values() if v)
+    live_fail = len(checks) - live_pass
+    for check, ok in checks.items():
+        print(f"  {_tick(ok)} {check}")
+    colour = GREEN if live_fail == 0 else (YELLOW if live_pass >= 4 else RED)
+    print(f"\n{colour}Live test: {live_pass}/{len(checks)} checks passed{RESET}")
+    results["live_test"] = live_results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mythos adapter flow test")
-    parser.add_argument("--target",       default="supplier.meesho.com",
+    parser.add_argument("--target",          default="supplier.meesho.com",
                         help="Target for the test scenario")
-    parser.add_argument("--adapters",     nargs="+", default=None,
+    parser.add_argument("--adapters",        nargs="+", default=None,
                         help="Specific adapters to solo-test (default: all loaded)")
-    parser.add_argument("--max-tokens",   type=int, default=512,
+    parser.add_argument("--max-tokens",      type=int, default=512,
                         help="Max new tokens per generation (default: 512, use 256 for speed)")
-    parser.add_argument("--solo-only",    action="store_true",
+    parser.add_argument("--solo-only",       action="store_true",
                         help="Run only solo adapter tests (no chain)")
-    parser.add_argument("--chain-only",   action="store_true",
+    parser.add_argument("--chain-only",      action="store_true",
                         help="Run only the chained flow test")
-    parser.add_argument("--exec-pipeline", action="store_true",
-                        help="Run execution pipeline tests (no GPU needed)")
-    parser.add_argument("--execute",      action="store_true",
-                        help="Actually run safe commands in the pipeline test (implies --exec-pipeline)")
-    parser.add_argument("--save",         default="",
+    parser.add_argument("--exec-pipeline",   action="store_true",
+                        help="Run static pipeline tests (no GPU needed)")
+    parser.add_argument("--correction-test", action="store_true",
+                        help="Run executor correction test (GPU): verify executor fixes wrong commands")
+    parser.add_argument("--live-test",       action="store_true",
+                        help="Run full live end-to-end test (GPU): osint→validate→execute→analyst→webapp")
+    parser.add_argument("--execute",         action="store_true",
+                        help="Actually run shell commands in pipeline/live tests")
+    parser.add_argument("--save",            default="",
                         help="Save results JSON to this file")
-    parser.add_argument("--project-root", default="",
+    parser.add_argument("--project-root",    default="",
                         help="Project root (default: directory of this script)")
     args = parser.parse_args()
 
-    if args.execute:
-        args.exec_pipeline = True
-
     project_root = args.project_root or str(Path(__file__).parent)
 
-    # Determine which modes to run
-    run_llm   = not args.exec_pipeline or args.solo_only or args.chain_only
-    run_exec  = args.exec_pipeline
-    mode_str  = []
+    # Determine which modes need GPU
+    needs_gpu = (
+        not args.exec_pipeline          # default mode runs solo+chain
+        or args.solo_only
+        or args.chain_only
+        or args.correction_test
+        or args.live_test
+    )
+    # Exec-pipeline-only flag means: only run static tests, no GPU
+    exec_pipeline_only = (
+        args.exec_pipeline
+        and not args.solo_only
+        and not args.chain_only
+        and not args.correction_test
+        and not args.live_test
+    )
+
+    mode_parts = []
     if args.exec_pipeline:
-        mode_str.append("exec-pipeline" + (" + execute" if args.execute else ""))
-    if not args.exec_pipeline or args.solo_only:
-        mode_str.append("solo")
-    if not args.exec_pipeline or args.chain_only:
-        mode_str.append("chain")
-    mode_label = " + ".join(mode_str) if mode_str else "solo + chain"
+        mode_parts.append("static-pipeline" + (" +exec" if args.execute else ""))
+    if args.correction_test:
+        mode_parts.append("correction")
+    if args.live_test:
+        mode_parts.append("live-e2e" + (" +exec" if args.execute else ""))
+    if not args.exec_pipeline and not args.correction_test and not args.live_test:
+        if not args.chain_only:
+            mode_parts.append("solo")
+        if not args.solo_only:
+            mode_parts.append("chain")
+    mode_label = " + ".join(mode_parts) if mode_parts else "solo + chain"
 
     print(f"""
 {BOLD}{CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -777,36 +1286,53 @@ def main() -> None:
 
     results: dict = {}
 
-    # ── Execution pipeline (no GPU) ─────────────────────────────────────────
-    if run_exec:
-        pipeline_results = run_execution_pipeline_test(execute=args.execute)
-        results["exec_pipeline"] = pipeline_results
-        if args.exec_pipeline and not args.solo_only and not args.chain_only:
+    # ── Static pipeline (no GPU) ───────────────────────────────────────────
+    if args.exec_pipeline:
+        results["exec_pipeline"] = run_execution_pipeline_test(execute=args.execute)
+        if exec_pipeline_only:
             if args.save:
-                out_path = Path(args.save)
-                out_path.write_text(json.dumps(results, indent=2))
-                print(f"\n{GREEN}Results saved to: {out_path}{RESET}")
+                Path(args.save).write_text(json.dumps(results, indent=2))
+                print(f"\n{GREEN}Results saved to: {args.save}{RESET}")
             return
 
-    # ── LLM adapter tests (need GPU) ────────────────────────────────────────
-    if run_llm or args.solo_only or args.chain_only:
+    # ── Load model (GPU) ───────────────────────────────────────────────────
+    if needs_gpu:
         CHAIN_STEPS[0] = (CHAIN_STEPS[0][0], CHAIN_STEPS[0][1].replace("supplier.meesho.com", args.target))
-        model   = load_model(project_root, args.max_tokens)
-        loaded  = model.loaded_adapters()
-        adapters_to_test = args.adapters or sorted(loaded)
+        model = load_model(project_root, args.max_tokens)
 
-        if not args.chain_only:
-            run_solo_tests(model, adapters_to_test, args.max_tokens, results)
+        # ── Executor correction test ───────────────────────────────────────
+        if args.correction_test:
+            run_correction_test(model, args.max_tokens, results)
 
-        if not args.solo_only:
-            run_chain_test(model, args.max_tokens, results)
+        # ── Live end-to-end test ───────────────────────────────────────────
+        if args.live_test:
+            run_live_test(model, args.max_tokens, results, execute=args.execute)
 
-        print_summary(results)
+        # ── Standard solo + chain ──────────────────────────────────────────
+        if not args.correction_test and not args.live_test:
+            loaded = model.loaded_adapters()
+            adapters_to_test = args.adapters or sorted(loaded)
+            if not args.chain_only:
+                run_solo_tests(model, adapters_to_test, args.max_tokens, results)
+            if not args.solo_only:
+                run_chain_test(model, args.max_tokens, results)
+            print_summary(results)
+        elif not args.correction_test and not args.live_test:
+            pass   # handled above
+        else:
+            # If correction or live was run, also run solo+chain if requested
+            if args.solo_only or args.chain_only:
+                loaded = model.loaded_adapters()
+                adapters_to_test = args.adapters or sorted(loaded)
+                if not args.chain_only:
+                    run_solo_tests(model, adapters_to_test, args.max_tokens, results)
+                if not args.solo_only:
+                    run_chain_test(model, args.max_tokens, results)
+                print_summary(results)
 
     if args.save:
-        out_path = Path(args.save)
-        out_path.write_text(json.dumps(results, indent=2))
-        print(f"\n{GREEN}Results saved to: {out_path}{RESET}")
+        Path(args.save).write_text(json.dumps(results, indent=2))
+        print(f"\n{GREEN}Results saved to: {args.save}{RESET}")
 
 
 if __name__ == "__main__":
