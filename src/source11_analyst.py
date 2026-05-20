@@ -561,6 +561,15 @@ def generate_synth_chain(scenario: dict) -> dict | None:
 
     if not steps:
         return None
+    
+    # Filter out steps missing required fields
+    valid_steps = []
+    for step in steps:
+        if all(k in step for k in ("tool", "output", "analyst_interpretation")):
+            valid_steps.append(step)
+    
+    if not valid_steps:
+        return None
 
     messages: list[dict] = [{"role": "system", "content": SYSTEM_INTERP}]
     messages.append({
@@ -569,17 +578,17 @@ def generate_synth_chain(scenario: dict) -> dict | None:
             f"Target: {scenario['target']}\n"
             f"Mode: {scenario['mode']}\n"
             f"Phase: {scenario['phase']}\n\n"
-            f"Tool: {steps[0]['tool']}\n"
-            f"Command: {steps[0].get('command', '')}\n\n"
-            f"Output:\n```\n{steps[0]['output']}\n```\n\n"
+            f"Tool: {valid_steps[0]['tool']}\n"
+            f"Command: {valid_steps[0].get('command', '')}\n\n"
+            f"Output:\n```\n{valid_steps[0]['output']}\n```\n\n"
             f"Interpret this output."
         ),
     })
     messages.append({
         "role": "assistant",
-        "content": steps[0]["analyst_interpretation"],
+        "content": valid_steps[0]["analyst_interpretation"],
     })
-    for step in steps[1:]:
+    for step in valid_steps[1:]:
         messages.append({
             "role": "user",
             "content": (
@@ -598,7 +607,7 @@ def generate_synth_chain(scenario: dict) -> dict | None:
         "type": "synth",
         "phase": scenario["phase"],
         "mode": scenario["mode"],
-        "n_steps": n_steps,
+        "n_steps": len(valid_steps),
         "messages": messages,
     }
 
