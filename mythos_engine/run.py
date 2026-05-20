@@ -95,8 +95,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature",    type=float, default=0.3)
 
     # ── RAG live intelligence ─────────────────────────────────────────────────
-    p.add_argument("--rag", action="store_true",
-                   help="Enable RAG: inject live NVD CVE + Exploit-DB context into prompts")
+    p.add_argument("--rag", action="store_true", default=None,
+                   help="Enable RAG: inject live NVD CVE + Exploit-DB + GHSA context "
+                        "(enabled by default; use --no-rag to disable)")
+    p.add_argument("--no-rag", action="store_true",
+                   help="Disable live RAG intelligence injection")
     p.add_argument("--rag-max-age", type=int, default=24, metavar="HOURS",
                    help="Refresh RAG cache after this many hours (default: 24)")
 
@@ -157,8 +160,8 @@ def _build_config(args: argparse.Namespace) -> "PentestGPTConfig":
         bug_bounty=getattr(args, "bug_bounty", False),
         scope_file=getattr(args, "scope", None),
         program_handle=getattr(args, "program", "") or "",
-        # RAG
-        rag_enabled=getattr(args, "rag", False),
+        # RAG — enabled by default; --no-rag explicitly disables
+        rag_enabled=not getattr(args, "no_rag", False),
         rag_max_age_hours=getattr(args, "rag_max_age", 24),
         # Feedback loop
         feedback_enabled=not getattr(args, "no_feedback", False),

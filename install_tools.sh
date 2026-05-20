@@ -219,7 +219,20 @@ fi
 # ── 6. HTTP probing & fingerprinting ─────────────────────────────────────────
 header "HTTP Probing & Fingerprinting"
 
-install_go_tool "httpx"    "github.com/projectdiscovery/httpx/cmd/httpx@latest"
+# Install projectdiscovery/httpx as 'httpx' in system bin dir.
+# This MUST shadow the Python httpx (venv bin / user local bin) — the model
+# is trained on projectdiscovery/httpx flags (-l, -status-code, -title, -tech).
+# If Go httpx is already at /usr/local/bin/httpx, skip; otherwise install.
+if [[ "$(command -v httpx 2>/dev/null)" == *".venv"* ]] || [[ "$(command -v httpx 2>/dev/null)" == *"site-packages"* ]] || ! command -v httpx &>/dev/null; then
+    install_go_tool "httpx" "github.com/projectdiscovery/httpx/cmd/httpx@latest"
+    # Move to INSTALL_DIR to ensure it shadows the Python binary
+    if [[ -f "${HOME}/go/bin/httpx" ]] && [[ -w "${INSTALL_DIR}" ]]; then
+        cp "${HOME}/go/bin/httpx" "${INSTALL_DIR}/httpx"
+        success "Copied projectdiscovery/httpx to ${INSTALL_DIR}/httpx (shadows Python httpx)"
+    fi
+else
+    success "httpx (projectdiscovery — already installed at $(command -v httpx))"
+fi
 install_go_tool "katana"   "github.com/projectdiscovery/katana/cmd/katana@latest"
 install_go_tool "waybackurls" "github.com/tomnomnom/waybackurls@latest"
 install_go_tool "gau"      "github.com/lc/gau/v2/cmd/gau@latest"
