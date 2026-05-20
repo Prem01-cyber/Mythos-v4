@@ -224,8 +224,8 @@ SYNTH_SCENARIOS = [
 client = OpenAI()
 
 # Batch processing config
-BATCH_SIZE = 50  # increased batch size for parallel processing
-MAX_WORKERS = 20  # parallel API calls
+BATCH_SIZE = 50
+MAX_WORKERS = 40  # parallel API calls — OpenAI handles this fine
 
 
 def _gpt_single(prompt: str, max_tokens: int = 2000, model: str = "gpt-4o-mini") -> str:
@@ -768,8 +768,12 @@ def main() -> None:
 
         print(f"  Generating {needed} examples with {MAX_WORKERS} parallel workers...")
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futs = list(executor.map(_synth_one, range(needed)))
-        batch_examples = [ex for ex in futs if ex]
+            futs = {executor.submit(_synth_one, i): i for i in range(needed)}
+            batch_examples = []
+            for fut in tqdm(as_completed(futs), total=needed, desc="synth-examples"):
+                ex = fut.result()
+                if ex:
+                    batch_examples.append(ex)
         total_written += append_jsonl(args.out_synth, batch_examples)
         print(f"  Written {len(batch_examples)} synth examples")
 
