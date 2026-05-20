@@ -70,6 +70,14 @@ SOURCES = [
     ("raw/webapp.jsonl",          "webapp",      1792, "processed/webapp.jsonl"),
     ("raw/osint.jsonl",           "osint",       1024, "processed/osint.jsonl"),
     ("raw/cloud.jsonl",           "cloud",       1280, "processed/cloud.jsonl"),
+    # New adapters (sources 10-13) — all fit within 1024 tokens
+    ("raw/executor_correction.jsonl", "executor",  1024, "processed/executor_correction.jsonl"),
+    ("raw/executor_filtering.jsonl",  "executor",  1024, "processed/executor_filtering.jsonl"),
+    ("raw/analyst_h1.jsonl",          "analyst",   1024, "processed/analyst_h1.jsonl"),
+    ("raw/planner_decomp.jsonl",      "planner",   1024, "processed/planner_decomp.jsonl"),
+    ("raw/researcher_synth.jsonl",    "researcher",1024, "processed/researcher_synth.jsonl"),
+    ("raw/researcher_pz.jsonl",       "researcher",1024, "processed/researcher_pz.jsonl"),
+    ("raw/researcher_ctf.jsonl",      "researcher",1024, "processed/researcher_ctf.jsonl"),
 ]
 
 SOURCE_FILTER = {
@@ -81,6 +89,10 @@ SOURCE_FILTER = {
     "webapp":    5,
     "osint":     6,
     "cloud":     7,
+    "executor":  8,
+    "analyst":   9,
+    "planner":   10,
+    "researcher":11,
 }
 
 OUTPUT_PATH = "processed/combined.jsonl"
@@ -247,9 +259,12 @@ def main() -> None:
     print(f"  Output : {OUTPUT_PATH}")
     print(f"{'═' * 60}\n")
 
-    sources_to_run = (
-        [SOURCES[SOURCE_FILTER[args.source]]] if args.source else SOURCES
-    )
+    sources_to_run = []
+    if args.source:
+        # Filter to all entries matching the requested source label
+        sources_to_run = [s for s in SOURCES if s[1] == args.source]
+    else:
+        sources_to_run = SOURCES
 
     all_examples: list[dict] = []
     for raw_in, label, max_tok, proc_out in sources_to_run:

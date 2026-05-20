@@ -29,6 +29,10 @@ Architecture: Specialized LoRA Adapters (one per source)
     • Adapter 6 (webapp)      → Web application exploitation (OWASP Top 10)
     • Adapter 7 (osint)       → OSINT and external reconnaissance
     • Adapter 8 (cloud)       → Cloud security (AWS/Azure/GCP)
+    • Adapter 9 (executor)    → Command correction + output filtering
+    • Adapter 10 (analyst)    → HackerOne reports + tool interpretation
+    • Adapter 11 (planner)    → Goal decomposition + adaptive replanning
+    • Adapter 12 (researcher) → Novelty discovery via anomaly reasoning
 
   --source flag selects which dataset this adapter trains on.
   Output path automatically namespaced: outputs/mythos-v4-{source}/
@@ -68,7 +72,9 @@ parser.add_argument("--model",   default="q3-14b",
                              "7b/14b/32b = legacy Qwen2.5-Coder variants")
 parser.add_argument("--source",  default=None,
                     choices=["exploitdb", "htb", "vulhub", "attack",
-                             "ad", "webapp", "osint", "cloud", "combined"],
+                             "ad", "webapp", "osint", "cloud",
+                             "executor", "analyst", "planner", "researcher",
+                             "combined"],
                     help="Which dataset to train on. "
                          "exploitdb → exploit code adapter (3 epochs, seq=2048); "
                          "htb → pentest methodology adapter (3 epochs, seq=2560); "
@@ -78,6 +84,10 @@ parser.add_argument("--source",  default=None,
                          "webapp → web app exploitation adapter (10 epochs, seq=1792); "
                          "osint → OSINT recon adapter (12 epochs, seq=1024); "
                          "cloud → cloud security adapter (14 epochs, seq=1280); "
+                         "executor → command correction + output filtering (10 epochs, seq=1024); "
+                         "analyst → HackerOne reports + tool interpretation (10 epochs, seq=1024); "
+                         "planner → goal decomposition + adaptive replanning (8 epochs, seq=1024); "
+                         "researcher → novelty discovery via anomaly reasoning (4 epochs, seq=1024); "
                          "combined → all sources merged (ablation only)")
 parser.add_argument("--data",    default=None,
                     help="Override dataset path (optional, --source sets this automatically)")
@@ -140,6 +150,10 @@ MODEL_NAME = MODEL_MAP[args.model]
 #   webapp:     326 ex / 16 × 10 epochs = 204 steps
 #   osint:      287 ex / 16 × 12 epochs = 215 steps
 #   cloud:      255 ex / 16 × 14 epochs = 222 steps (smallest)
+#   executor:   631 ex / 16 × 10 epochs = ~395 steps  
+#   analyst:    637 ex / 16 × 10 epochs = ~398 steps
+#   planner:    914 ex / 16 × 8 epochs  = ~457 steps
+#   researcher: 1992 ex / 16 × 4 epochs = ~498 steps
 SOURCE_MAP = {
     # source   (data path,                        output dir,                    epochs, seq_len)
     "exploitdb": ("processed/exploitdb.jsonl",    "outputs/mythos-v4-exploitdb",  3,   2048),
@@ -150,6 +164,10 @@ SOURCE_MAP = {
     "webapp":    ("processed/webapp.jsonl",        "outputs/mythos-v4-webapp",    10,   1792),
     "osint":     ("processed/osint.jsonl",         "outputs/mythos-v4-osint",     12,   1024),
     "cloud":     ("processed/cloud.jsonl",         "outputs/mythos-v4-cloud",     14,   1280),
+    "executor":  ("processed/executor.jsonl",      "outputs/mythos-v4-executor",  10,   1024),  # command correction + output filtering
+    "analyst":   ("processed/analyst.jsonl",       "outputs/mythos-v4-analyst",   10,   1024),  # HackerOne reports + tool interpretation
+    "planner":   ("processed/planner.jsonl",       "outputs/mythos-v4-planner",    8,   1024),  # goal decomposition + replanning
+    "researcher":("processed/researcher.jsonl",    "outputs/mythos-v4-researcher", 4,   1024),  # novelty discovery (3 subtypes merged)
     "combined":  ("processed/combined.jsonl",      "outputs/mythos-v4-combined",   3,   2048),
 }
 
@@ -162,7 +180,7 @@ elif args.data:
     _epoch_default = 3
     _seq_default   = 3000
 else:
-    parser.error("Specify --source (exploitdb | htb | vulhub | attack | ad | webapp | osint | cloud | combined).")
+    parser.error("Specify --source (exploitdb | htb | vulhub | attack | ad | webapp | osint | cloud | executor | analyst | planner | researcher | combined).")
 
 DATA_PATH   = args.data   or _data_default
 OUTPUT_DIR  = args.output or _out_default
