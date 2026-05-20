@@ -74,6 +74,7 @@ SOURCES = [
     ("raw/executor_correction.jsonl", "executor",  1024, "processed/executor_correction.jsonl"),
     ("raw/executor_filtering.jsonl",  "executor",  1024, "processed/executor_filtering.jsonl"),
     ("raw/analyst_h1.jsonl",          "analyst",   1024, "processed/analyst_h1.jsonl"),
+    ("raw/analyst_synth.jsonl",       "analyst",   1024, "processed/analyst_synth.jsonl"),
     ("raw/planner_decomp.jsonl",      "planner",   1024, "processed/planner_decomp.jsonl"),
     ("raw/planner_replan.jsonl",      "planner",   1024, "processed/planner_replan.jsonl"),
     ("raw/researcher_synth.jsonl",    "researcher",1024, "processed/researcher_synth.jsonl"),
