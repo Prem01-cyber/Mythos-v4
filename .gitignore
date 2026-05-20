@@ -24,6 +24,7 @@ env/
 
 # Model outputs and checkpoints — too large for git
 adapters/
+outputs/
 checkpoints/
 *.safetensors
 *.bin

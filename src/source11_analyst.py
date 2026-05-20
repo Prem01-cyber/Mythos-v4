@@ -50,7 +50,6 @@ OUTPUT_H1     = "raw/analyst_h1.jsonl"
 OUTPUT_SYNTH  = "raw/analyst_synth.jsonl"
 CACHE_DIR     = "raw/.analyst_cache"
 DEFAULT_WORKERS = 4
-API_DELAY     = 0.4
 
 TARGET_H1     = 1500
 TARGET_SYNTH  = 1500
@@ -225,8 +224,13 @@ SYNTH_SCENARIOS = [
 _gpt_lock = threading.Lock()
 client = OpenAI()
 
+# Batch processing config
+BATCH_SIZE = 20  # process 20 prompts at once
+API_DELAY  = 0.05  # minimal delay between batch requests
+
 
 def _gpt(prompt: str, max_tokens: int = 2000, model: str = "gpt-4o-mini") -> str:
+    """Single GPT call with rate limiting."""
     with _gpt_lock:
         time.sleep(API_DELAY)
     resp = client.chat.completions.create(
@@ -236,6 +240,26 @@ def _gpt(prompt: str, max_tokens: int = 2000, model: str = "gpt-4o-mini") -> str
         temperature=0.85,
     )
     return resp.choices[0].message.content.strip()
+
+
+def _gpt_batch(prompts: list[str], max_tokens: int = 2000, model: str = "gpt-4o-mini") -> list[str]:
+    """Batch GPT calls for efficiency."""
+    results = []
+    for prompt in prompts:
+        try:
+            with _gpt_lock:
+                time.sleep(API_DELAY)
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=0.85,
+            )
+            results.append(resp.choices[0].message.content.strip())
+        except Exception as e:
+            print(f"    [batch error: {e}]")
+            results.append("")
+    return results
 
 
 def _parse_json_obj(raw: str) -> dict:
@@ -285,12 +309,15 @@ def generate_synth_h1_report() -> dict | None:
     if not all(k in data for k in ("title", "summary")):
         return None
     # Normalise to the same shape extract_report_fields expects
+    summary = data.get("summary", "")
+    if not isinstance(summary, str):
+        summary = str(summary) if summary else ""
     return {
         "title":     data.get("title", ""),
         "severity":  data.get("severity", severity),
         "vuln_type": data.get("vuln_type", vuln_type),
         "weakness":  data.get("weakness", ""),
-        "summary":   data.get("summary", "")[:2000],
+        "summary":   summary[:2000],
     }
 
 
@@ -718,32 +745,75 @@ def main() -> None:
         else:
             print("  H1 API not accessible — generating all examples synthetically")
 
-        # Generate all examples (real cache + synthetic fallback)
-        def _h1_worker(_: int) -> int:
-            ex = generate_one_h1_example()
-            return append_jsonl(args.out_h1, [ex] if ex else [])
-
-        with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(_h1_worker, i): i for i in range(needed)}
-            for fut in tqdm(as_completed(futs), total=len(futs), desc="h1-examples"):
-                total_written += fut.result()
+        # Batch generate H1 examples (much faster)
+        print(f"  Generating {needed} examples in batches of {BATCH_SIZE}...")
+        for batch_start in tqdm(range(0, needed, BATCH_SIZE), desc="h1-batches"):
+            batch_size = min(BATCH_SIZE, needed - batch_start)
+            
+            # Generate batch of prompts
+            prompts = []
+            contexts = []
+            for _ in range(batch_size):
+                vuln_type   = random.choice(VULN_TYPES)
+                severity    = random.choices(SEVERITIES, weights=SEVERITY_WEIGHTS)[0]
+                target_type = random.choice(TARGET_TYPES)
+                prompt = SYNTH_H1_REPORT_PROMPT.format(
+                    vuln_type=vuln_type, severity=severity, target_type=target_type
+                )
+                prompts.append(prompt)
+                contexts.append((vuln_type, severity))
+            
+            # Batch GPT call
+            responses = _gpt_batch(prompts, max_tokens=1800)
+            
+            # Process batch results
+            batch_examples = []
+            for raw, (vuln_type, severity) in zip(responses, contexts):
+                if not raw:
+                    continue
+                try:
+                    data = _parse_json_obj(raw)
+                    if not all(k in data for k in ("title", "summary")):
+                        continue
+                    summary = data.get("summary", "")
+                    if not isinstance(summary, str):
+                        summary = str(summary) if summary else ""
+                    fields = {
+                        "title":     data.get("title", ""),
+                        "severity":  data.get("severity", severity),
+                        "vuln_type": data.get("vuln_type", vuln_type),
+                        "weakness":  data.get("weakness", ""),
+                        "summary":   summary[:2000],
+                    }
+                    ex = build_h1_training_example(fields)
+                    if ex:
+                        batch_examples.append(ex)
+                except Exception:
+                    continue
+            
+            # Write batch
+            total_written += append_jsonl(args.out_h1, batch_examples)
 
     if args.type in ("synth", "both"):
         existing = count_written(args.out_synth)
+        needed   = TARGET_SYNTH - existing
         print(f"\n[B] Synth examples: {existing}/{TARGET_SYNTH}")
 
-        def _synth_worker(_: int) -> int:
-            scenario = random.choice(SYNTH_SCENARIOS)
-            ex = generate_synth_chain(scenario)
-            if not ex:
-                return 0
-            return append_jsonl(args.out_synth, [ex])
-
-        needed = TARGET_SYNTH - existing
-        with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futs = {ex.submit(_synth_worker, i): i for i in range(needed)}
-            for fut in tqdm(as_completed(futs), total=len(futs), desc="synth-chains"):
-                total_written += fut.result()
+        # Batch generate synth examples  
+        print(f"  Generating {needed} examples in batches of {BATCH_SIZE}...")
+        for batch_start in tqdm(range(0, needed, BATCH_SIZE), desc="synth-batches"):
+            batch_size = min(BATCH_SIZE, needed - batch_start)
+            
+            # Process batch
+            batch_examples = []
+            for _ in range(batch_size):
+                scenario = random.choice(SYNTH_SCENARIOS)
+                ex = generate_synth_chain(scenario)
+                if ex:
+                    batch_examples.append(ex)
+            
+            # Write batch
+            total_written += append_jsonl(args.out_synth, batch_examples)
 
     print(f"\nWrote {total_written} new examples total")
     print(f"  H1    : {args.out_h1}")
