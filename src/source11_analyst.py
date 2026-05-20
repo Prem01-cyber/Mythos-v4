@@ -221,44 +221,37 @@ SYNTH_SCENARIOS = [
     {"target": "dev.startup.io", "mode": "bug-bounty", "phase": "webapp",    "tools": ["ffuf", "nikto", "whatweb", "nuclei"]},
 ]
 
-_gpt_lock = threading.Lock()
 client = OpenAI()
 
 # Batch processing config
-BATCH_SIZE = 20  # process 20 prompts at once
-API_DELAY  = 0.05  # minimal delay between batch requests
+BATCH_SIZE = 50  # increased batch size for parallel processing
+MAX_WORKERS = 20  # parallel API calls
+
+
+def _gpt_single(prompt: str, max_tokens: int = 2000, model: str = "gpt-4o-mini") -> str:
+    """Single GPT call - no locking needed for parallel calls."""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=0.85,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return ""
 
 
 def _gpt(prompt: str, max_tokens: int = 2000, model: str = "gpt-4o-mini") -> str:
-    """Single GPT call with rate limiting."""
-    with _gpt_lock:
-        time.sleep(API_DELAY)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=max_tokens,
-        temperature=0.85,
-    )
-    return resp.choices[0].message.content.strip()
+    """Single GPT call (kept for compatibility)."""
+    return _gpt_single(prompt, max_tokens, model)
 
 
 def _gpt_batch(prompts: list[str], max_tokens: int = 2000, model: str = "gpt-4o-mini") -> list[str]:
-    """Batch GPT calls for efficiency."""
-    results = []
-    for prompt in prompts:
-        try:
-            with _gpt_lock:
-                time.sleep(API_DELAY)
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=0.85,
-            )
-            results.append(resp.choices[0].message.content.strip())
-        except Exception as e:
-            print(f"    [batch error: {e}]")
-            results.append("")
+    """Parallel batch GPT calls - much faster!"""
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(_gpt_single, p, max_tokens, model) for p in prompts]
+        results = [f.result() for f in futures]
     return results
 
 
