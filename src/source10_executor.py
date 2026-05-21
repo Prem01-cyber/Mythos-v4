@@ -38,6 +38,11 @@ from openai import OpenAI
 from tqdm import tqdm
 from dotenv import load_dotenv
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from prompts import EXECUTOR_CORRECTION as SYSTEM_CORRECTION, EXECUTOR_FILTERING as SYSTEM_FILTERING
+
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -65,22 +70,7 @@ PENTEST_TOOLS = [
     "jwt_tool", "sslyze", "testssl.sh", "crackmapexec",
 ]
 
-SYSTEM_CORRECTION = (
-    "You are an expert command correction specialist for penetration testing tools. "
-    "When given a broken command, its error output, and the tool's help text, you reason "
-    "step-by-step about what went wrong and produce the corrected command. "
-    "Always respond with your reasoning inside <thought>...</thought> tags "
-    "followed by the corrected command inside <corrected>...</corrected> tags. "
-    "The corrected command must be syntactically valid and match the tool's actual flags."
-)
 
-SYSTEM_FILTERING = (
-    "You are an expert security analyst specialising in tool output triage. "
-    "Given raw, noisy output from a security tool, extract only the findings that matter: "
-    "open ports, discovered endpoints, potential vulnerabilities, and interesting data. "
-    "Strip progress bars, ANSI codes, timing lines, boilerplate headers, and repeated noise. "
-    "Respond with a concise FINDINGS block followed by a one-sentence SUMMARY."
-)
 
 CORRECTION_GEN_PROMPT = """\
 You are building a training dataset for a command-correction AI.

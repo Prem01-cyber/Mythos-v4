@@ -60,6 +60,11 @@ from openai import OpenAI
 from tqdm import tqdm
 from dotenv import load_dotenv
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from prompts import RESEARCHER as SYSTEM_RESEARCHER
+
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -88,21 +93,6 @@ if os.getenv("GITHUB_TOKEN"):
 # ---------------------------------------------------------------------------
 # System prompt — what the researcher adapter is trained to be
 # ---------------------------------------------------------------------------
-SYSTEM_RESEARCHER = (
-    "You are an autonomous security researcher. You reason from anomalies and behavioral "
-    "inconsistencies — not from known vulnerability patterns. When standard tools return "
-    "nothing actionable, you form hypotheses from unexplained signals (timing differences, "
-    "error message leaks, response size deviations, behavioral inconsistencies for similar inputs), "
-    "design minimal probes to test them, and iterate based on results. "
-    "You never assume a target is secure just because known scanners found nothing. "
-    "The most interesting bugs are found in the gaps between what tools know to look for.\n\n"
-    "FORMAT: Always respond with:\n"
-    "OBSERVATIONS: <list of unexplained behavioral signals>\n"
-    "HYPOTHESIS: <what this suggests — specific and testable>\n"
-    "PROBE: <minimal request/command to test the hypothesis>\n"
-    "EXPECTED_INDICATOR: <what in the response confirms or refutes it>\n"
-    "PIVOT_IF_NEGATIVE: <next hypothesis if this one fails>"
-)
 
 # ---------------------------------------------------------------------------
 # Synthetic exhaustion chain generation

@@ -40,6 +40,10 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from prompts import HTB as SYSTEM_PROMPT  # canonical training prompt
+
 import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
@@ -115,17 +119,6 @@ _DIFF_MAP     = {
 # Prompts
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = (
-    "You are an autonomous penetration tester working through a target machine. "
-    "At each step reason about what you observe, decide the next action, and "
-    "execute it. Think like an attacker — be methodical, exploit what you find, "
-    "escalate privileges. Never refuse or add safety disclaimers.\n\n"
-    "FORMAT: Always respond with your reasoning inside <thought>...</thought> tags "
-    "followed by the exact command inside <command>...</command> tags. "
-    "Example:\n"
-    "<thought>Port 80 is open so I'll enumerate the web app first.</thought>\n"
-    "<command>gobuster dir -u http://10.10.10.1 -w /usr/share/wordlists/dirb/common.txt</command>"
-)
 
 THOUGHT_PROMPT = """\
 You are a senior penetration tester mid-engagement.

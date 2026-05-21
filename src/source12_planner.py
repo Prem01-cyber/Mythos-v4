@@ -36,6 +36,11 @@ from openai import OpenAI
 from tqdm import tqdm
 from dotenv import load_dotenv
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from prompts import PLANNER as SYSTEM_PLANNER, PLANNER as SYSTEM_REPLANNER
+
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -75,23 +80,7 @@ HACKTRICKS_PENTESTING_PATHS = [
     "pentesting-web/graphql.md",
 ]
 
-SYSTEM_PLANNER = (
-    "You are an autonomous penetration testing planner. "
-    "Given a target, engagement mode, and current phase, you produce a precise, "
-    "prioritised, step-by-step attack plan. "
-    "Each step specifies: the objective, the tool(s) to use, the exact command, "
-    "and the success criteria. "
-    "Plans must be realistic, executable, and adapted to the engagement constraints. "
-    "Think like an experienced red teamer who has done this hundreds of times."
-)
 
-SYSTEM_REPLANNER = (
-    "You are an autonomous penetration testing planner capable of adaptive re-planning. "
-    "When an executed step returns unexpected, blocked, or partial results, "
-    "you analyse what happened, update your mental model of the target, "
-    "and revise the remaining plan accordingly. "
-    "You never give up — you find alternative paths, different tools, or new angles."
-)
 
 DECOMP_PROMPT = """\
 You are generating training data for a penetration testing planner AI.

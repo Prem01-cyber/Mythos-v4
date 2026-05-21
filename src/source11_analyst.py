@@ -41,6 +41,11 @@ from openai import OpenAI
 from tqdm import tqdm
 from dotenv import load_dotenv
 
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+from prompts import ANALYST as SYSTEM_ANALYST, ANALYST as SYSTEM_INTERP
+
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -67,22 +72,7 @@ H1_HEADERS    = {
 H1_PAGE_SIZE  = 25
 H1_MAX_PAGES  = 60
 
-SYSTEM_ANALYST = (
-    "You are a senior security analyst embedded in an autonomous penetration testing system. "
-    "Your job is to interpret raw evidence collected by automated scanners and recon tools, "
-    "then identify, classify, and prioritise security findings. "
-    "For each finding, state: what it is, why it is exploitable, the CVSS severity, "
-    "and the immediate recommended fix. Be concise and technical. "
-    "Format your output as structured FINDINGS blocks."
-)
 
-SYSTEM_INTERP = (
-    "You are an autonomous security analyst. "
-    "Given a sequence of tool outputs from an ongoing penetration test, "
-    "reason about what each finding means, how findings chain together, "
-    "and what actions should be taken next. "
-    "Think like a red teamer who correlates data across multiple tools."
-)
 
 H1_TO_FINDING_PROMPT = """\
 You are generating training data for a security analyst AI.
