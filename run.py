@@ -255,12 +255,12 @@ async def run_engagement(args: argparse.Namespace) -> None:
     shell = None
     validator = None
     if args.execute:
-        from pentestgpt.core.tool_executor  import ShellExecutor
+        from pentestgpt.core.tool_executor    import ShellExecutor
         from pentestgpt.core.command_validator import CommandValidator
         workspace = str(Path(project_root) / "workspace")
         Path(workspace).mkdir(exist_ok=True)
-        shell     = ShellExecutor(workspace=workspace, base_timeout=args.execution_timeout)
-        validator = CommandValidator(workspace=workspace)
+        shell     = ShellExecutor(workspace=workspace, timeout=args.execution_timeout)
+        validator = CommandValidator()
 
     # ── Initial prompt ────────────────────────────────────────────────────────
     history: list[dict] = []
@@ -369,9 +369,9 @@ async def run_engagement(args: argparse.Namespace) -> None:
             final_cmd = cmd
             if validator:
                 try:
-                    vresult = validator.validate(cmd)
-                    if not vresult.valid:
-                        _warn(f"Validator flagged: {vresult.reason}")
+                    vresult = validator.validate_flags_sync([cmd])
+                    if vresult.needs_correction:
+                        _warn(f"Validator flagged: {'; '.join(str(e) for e in vresult.errors)}")
                         # Correct via executor adapter
                         if "executor" in model.loaded_adapters():
                             _hdr("EXECUTOR — correcting command", "executor")
@@ -379,7 +379,7 @@ async def run_engagement(args: argparse.Namespace) -> None:
                             corr_prompt = (
                                 f"The following command failed validation:\n"
                                 f"  {cmd}\n\n"
-                                f"Error: {vresult.reason}\n\n"
+                                f"Errors: {'; '.join(str(e) for e in vresult.errors)}\n\n"
                                 f"Generate the corrected command only, inside <command> tags."
                             )
                             exec_msgs = [
@@ -397,7 +397,7 @@ async def run_engagement(args: argparse.Namespace) -> None:
                             except Exception as exc:
                                 _warn(f"Executor failed: {exc}")
                     else:
-                        _ok(f"Command valid")
+                        _ok("Command valid")
                 except Exception as exc:
                     _warn(f"Validator error: {exc}")
 
@@ -408,10 +408,7 @@ async def run_engagement(args: argparse.Namespace) -> None:
             if shell:
                 _hdr(f"EXECUTING", "")
                 try:
-                    loop = asyncio.get_event_loop()
-                    exec_result = await loop.run_in_executor(
-                        None, lambda: shell.run(final_cmd)
-                    )
+                    exec_result = await shell.run(final_cmd)
                     tool_output = exec_result.stdout or exec_result.stderr or ""
                     exit_ok = exec_result.returncode == 0
                     sym = _ok if exit_ok else _warn
