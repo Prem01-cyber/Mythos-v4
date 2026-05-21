@@ -1,0 +1,14 @@
+{
+  "ad": 0,
+  "analyst": 1,
+  "attack": 2,
+  "cloud": 3,
+  "executor": 4,
+  "exploitdb": 5,
+  "htb": 6,
+  "osint": 7,
+  "planner": 8,
+  "researcher": 9,
+  "vulhub": 10,
+  "webapp": 11
+}

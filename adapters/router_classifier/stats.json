@@ -1,0 +1,74 @@
+{
+  "overall_accuracy": 0.9385,
+  "gated_accuracy": 0.9972,
+  "gated_coverage_pct": 85.8,
+  "conf_threshold": 0.7,
+  "encoder": "sentence-transformers/all-MiniLM-L6-v2",
+  "embed_dim": 384,
+  "hidden_dim": 256,
+  "num_classes": 12,
+  "train_examples": 2395,
+  "eval_examples": 423,
+  "per_class": {
+    "ad": {
+      "correct": 24,
+      "total": 26,
+      "accuracy": 0.9231
+    },
+    "analyst": {
+      "correct": 41,
+      "total": 42,
+      "accuracy": 0.9762
+    },
+    "attack": {
+      "correct": 16,
+      "total": 19,
+      "accuracy": 0.8421
+    },
+    "cloud": {
+      "correct": 18,
+      "total": 25,
+      "accuracy": 0.72
+    },
+    "executor": {
+      "correct": 47,
+      "total": 47,
+      "accuracy": 1.0
+    },
+    "exploitdb": {
+      "correct": 28,
+      "total": 28,
+      "accuracy": 1.0
+    },
+    "htb": {
+      "correct": 23,
+      "total": 25,
+      "accuracy": 0.92
+    },
+    "osint": {
+      "correct": 18,
+      "total": 20,
+      "accuracy": 0.9
+    },
+    "planner": {
+      "correct": 72,
+      "total": 72,
+      "accuracy": 1.0
+    },
+    "researcher": {
+      "correct": 82,
+      "total": 82,
+      "accuracy": 1.0
+    },
+    "vulhub": {
+      "correct": 13,
+      "total": 16,
+      "accuracy": 0.8125
+    },
+    "webapp": {
+      "correct": 15,
+      "total": 21,
+      "accuracy": 0.7143
+    }
+  }
+}
