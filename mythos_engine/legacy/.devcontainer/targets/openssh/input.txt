@@ -1,6 +1,0 @@
-root
-victor
-gpt
-debian
-vulhub
-nobody
