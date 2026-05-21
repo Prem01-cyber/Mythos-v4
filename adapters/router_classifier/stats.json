@@ -1,74 +1,74 @@
 {
-  "overall_accuracy": 0.9385,
-  "gated_accuracy": 0.9972,
-  "gated_coverage_pct": 85.8,
+  "overall_accuracy": 0.8944,
+  "gated_accuracy": 0.9948,
+  "gated_coverage_pct": 80.3,
   "conf_threshold": 0.7,
   "encoder": "sentence-transformers/all-MiniLM-L6-v2",
   "embed_dim": 384,
   "hidden_dim": 256,
   "num_classes": 12,
-  "train_examples": 2395,
-  "eval_examples": 423,
+  "train_examples": 2731,
+  "eval_examples": 483,
   "per_class": {
     "ad": {
-      "correct": 24,
-      "total": 26,
-      "accuracy": 0.9231
+      "correct": 26,
+      "total": 30,
+      "accuracy": 0.8667
     },
     "analyst": {
-      "correct": 41,
-      "total": 42,
-      "accuracy": 0.9762
+      "correct": 46,
+      "total": 49,
+      "accuracy": 0.9388
     },
     "attack": {
-      "correct": 16,
-      "total": 19,
-      "accuracy": 0.8421
+      "correct": 27,
+      "total": 31,
+      "accuracy": 0.871
     },
     "cloud": {
-      "correct": 18,
-      "total": 25,
-      "accuracy": 0.72
+      "correct": 25,
+      "total": 33,
+      "accuracy": 0.7576
     },
     "executor": {
-      "correct": 47,
-      "total": 47,
-      "accuracy": 1.0
+      "correct": 48,
+      "total": 49,
+      "accuracy": 0.9796
     },
     "exploitdb": {
-      "correct": 28,
-      "total": 28,
+      "correct": 22,
+      "total": 22,
       "accuracy": 1.0
     },
     "htb": {
-      "correct": 23,
-      "total": 25,
-      "accuracy": 0.92
+      "correct": 26,
+      "total": 31,
+      "accuracy": 0.8387
     },
     "osint": {
-      "correct": 18,
-      "total": 20,
-      "accuracy": 0.9
+      "correct": 25,
+      "total": 29,
+      "accuracy": 0.8621
     },
     "planner": {
-      "correct": 72,
-      "total": 72,
-      "accuracy": 1.0
+      "correct": 68,
+      "total": 70,
+      "accuracy": 0.9714
     },
     "researcher": {
-      "correct": 82,
-      "total": 82,
-      "accuracy": 1.0
+      "correct": 86,
+      "total": 90,
+      "accuracy": 0.9556
     },
     "vulhub": {
-      "correct": 13,
-      "total": 16,
-      "accuracy": 0.8125
+      "correct": 20,
+      "total": 26,
+      "accuracy": 0.7692
     },
     "webapp": {
-      "correct": 15,
-      "total": 21,
-      "accuracy": 0.7143
+      "correct": 13,
+      "total": 23,
+      "accuracy": 0.5652
     }
   }
 }
