@@ -365,41 +365,24 @@ async def run_engagement(args: argparse.Namespace) -> None:
             null_step_count = 0
             cmd = raw_cmds[0]   # execute the first extracted command
 
-            # ── 5. VALIDATION + CORRECTION ────────────────────────────────────
+            # ── 5. PLACEHOLDER / FABRICATION CHECK + POST-EXEC CORRECTION ────────
+            # We do NOT pre-validate flags — the flag-set validator has too many
+            # false positives (subfinder -silent, projectdiscovery httpx flags, etc.)
+            # because help output formats vary. Instead we:
+            #   a) block literal placeholders (YOUR_TARGET, <IP>, etc.)
+            #   b) block fabricated echo "output" commands
+            #   c) after execution, if exit_code != 0, route error to executor
             final_cmd = cmd
-            if validator:
-                try:
-                    vresult = validator.validate_flags_sync([cmd])
-                    if vresult.needs_correction:
-                        _warn(f"Validator flagged: {'; '.join(str(e) for e in vresult.errors)}")
-                        # Correct via executor adapter
-                        if "executor" in model.loaded_adapters():
-                            _hdr("EXECUTOR — correcting command", "executor")
-                            from pentestgpt.prompts.mythos_prompts import SYSTEM_PROMPTS as _SP
-                            corr_prompt = (
-                                f"The following command failed validation:\n"
-                                f"  {cmd}\n\n"
-                                f"Errors: {'; '.join(str(e) for e in vresult.errors)}\n\n"
-                                f"Generate the corrected command only, inside <command> tags."
-                            )
-                            exec_msgs = [
-                                {"role": "system", "content": _SP.get("executor", "")},
-                                {"role": "user", "content": corr_prompt},
-                            ]
-                            try:
-                                corr_resp = model.generate("executor", exec_msgs, max_new_tokens=256)
-                                corr_cmds = _tmp_shell.extract_commands(corr_resp)
-                                if corr_cmds:
-                                    final_cmd = corr_cmds[0]
-                                    _ok(f"Executor corrected → {final_cmd}")
-                                else:
-                                    _warn("Executor returned no command — using original")
-                            except Exception as exc:
-                                _warn(f"Executor failed: {exc}")
-                    else:
-                        _ok("Command valid")
-                except Exception as exc:
-                    _warn(f"Validator error: {exc}")
+            if _tmp_shell._has_placeholder(final_cmd):
+                _warn(f"Placeholder detected in command — skipping: {final_cmd}")
+                history.append({"role": "user",      "content": current_msg})
+                history.append({"role": "assistant", "content": response})
+                current_msg = (
+                    f"The command you generated contains an unfilled placeholder: {final_cmd}\n"
+                    f"Replace all placeholders (<TARGET>, YOUR_DOMAIN, etc.) with the actual "
+                    f"target: {args.target}. Generate the corrected command."
+                )
+                continue
 
             print(f"\n  {B}COMMAND{R}  {YEL}{final_cmd}{R}\n")
 
@@ -410,15 +393,50 @@ async def run_engagement(args: argparse.Namespace) -> None:
                 try:
                     exec_result = await shell.run(final_cmd)
                     tool_output = exec_result.stdout or exec_result.stderr or ""
-                    exit_ok = exec_result.returncode == 0
+                    exit_ok = exec_result.exit_code == 0
                     sym = _ok if exit_ok else _warn
-                    sym(f"exit={exec_result.returncode}  ({len(tool_output)} chars output)")
+                    sym(f"exit={exec_result.exit_code}  ({len(tool_output)} chars output)")
                     if tool_output:
-                        # Print first 40 lines
                         lines = tool_output.splitlines()
                         print("\n".join(f"    {l}" for l in lines[:40]))
                         if len(lines) > 40:
                             _info(f"[…{len(lines)-40} more lines]")
+
+                    # ── Post-execution correction via executor ─────────────────
+                    _FLAG_ERROR_SIGNALS = (
+                        "unknown flag", "unknown shorthand flag", "flag provided but not defined",
+                        "unrecognized option", "invalid option", "no such option",
+                        "error: unknown", "usage:", "unknown command",
+                    )
+                    if not exit_ok and any(s in tool_output.lower() for s in _FLAG_ERROR_SIGNALS):
+                        if "executor" in model.loaded_adapters():
+                            _hdr("EXECUTOR — fixing flag error", "executor")
+                            from pentestgpt.prompts.mythos_prompts import SYSTEM_PROMPTS as _SP
+                            corr_prompt = (
+                                f"Command: {final_cmd}\n\n"
+                                f"Error output:\n{tool_output[:600]}\n\n"
+                                f"The command failed due to an invalid flag or wrong syntax. "
+                                f"Generate the corrected command inside <command> tags."
+                            )
+                            exec_msgs = [
+                                {"role": "system", "content": _SP.get("executor", "")},
+                                {"role": "user",   "content": corr_prompt},
+                            ]
+                            try:
+                                corr_resp = model.generate("executor", exec_msgs, max_new_tokens=256)
+                                corr_cmds = _tmp_shell.extract_commands(corr_resp)
+                                if corr_cmds:
+                                    _ok(f"Executor corrected → {corr_cmds[0]}")
+                                    # Re-run corrected command
+                                    exec_result2 = await shell.run(corr_cmds[0])
+                                    tool_output  = exec_result2.stdout or exec_result2.stderr or ""
+                                    final_cmd    = corr_cmds[0]
+                                    _ok(f"Re-run exit={exec_result2.exit_code}  ({len(tool_output)} chars)")
+                                    if tool_output:
+                                        lines2 = tool_output.splitlines()
+                                        print("\n".join(f"    {l}" for l in lines2[:30]))
+                            except Exception as exc:
+                                _warn(f"Executor re-run failed: {exc}")
                 except Exception as exc:
                     _err(f"Execution error: {exc}")
                     tool_output = f"ERROR: {exc}"
