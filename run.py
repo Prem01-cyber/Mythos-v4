@@ -248,11 +248,8 @@ async def run_engagement(args: argparse.Namespace) -> None:
     # ── Engagement state ──────────────────────────────────────────────────────
     from pentestgpt.core.engagement_state import EngagementState, Phase
     mode_str = "bug_bounty" if args.bug_bounty else "ctf"
-    state    = EngagementState(
-        target=args.target,
-        mode=mode_str,
-        phase=Phase.IDLE,
-    )
+    state    = EngagementState(mode=mode_str)
+    state.set_target(args.target)
 
     # ── Tool executor (if --execute) ──────────────────────────────────────────
     shell = None
@@ -378,6 +375,7 @@ async def run_engagement(args: argparse.Namespace) -> None:
                         # Correct via executor adapter
                         if "executor" in model.loaded_adapters():
                             _hdr("EXECUTOR — correcting command", "executor")
+                            from pentestgpt.prompts.mythos_prompts import SYSTEM_PROMPTS as _SP
                             corr_prompt = (
                                 f"The following command failed validation:\n"
                                 f"  {cmd}\n\n"
@@ -385,9 +383,7 @@ async def run_engagement(args: argparse.Namespace) -> None:
                                 f"Generate the corrected command only, inside <command> tags."
                             )
                             exec_msgs = [
-                                {"role": "system", "content":
-                                 __import__("pentestgpt.prompts.mythos_prompts",
-                                            fromlist=["SYSTEM_PROMPTS"]).SYSTEM_PROMPTS.get("executor","")},
+                                {"role": "system", "content": _SP.get("executor", "")},
                                 {"role": "user", "content": corr_prompt},
                             ]
                             try:
@@ -482,8 +478,9 @@ async def run_engagement(args: argparse.Namespace) -> None:
                 f"Propose and execute the next highest-value action."
             )
 
-            # Advance phase based on findings
-            _maybe_advance_phase(state, tool_output, mode_str)
+            # Advance phase based on tool output (uses built-in state machine)
+            if tool_output:
+                state.update_from_output(tool_output)
             _info(f"Phase: {state.phase.value}")
 
     except KeyboardInterrupt:
@@ -499,23 +496,6 @@ async def run_engagement(args: argparse.Namespace) -> None:
             print(f"\n{DIM}Knowledge collected:{R}")
             print(ctx[:800])
 
-
-def _maybe_advance_phase(state, tool_output: str, mode: str) -> None:
-    """Simple heuristic phase advancement — mirrors EngagementState.update()."""
-    from pentestgpt.core.engagement_state import Phase
-    out = tool_output.lower()
-    if mode == "bug_bounty":
-        if state.phase == Phase.IDLE and any(x in out for x in ["subdomain", "meesho.com"]):
-            state.phase = Phase.RECON
-        elif state.phase == Phase.RECON and any(x in out for x in ["200", "301", "nginx", "apache"]):
-            state.phase = Phase.SUBDOMAIN_ENUM
-        elif state.phase == Phase.SUBDOMAIN_ENUM and any(x in out for x in ["200", "react", "angular"]):
-            state.phase = Phase.FINGERPRINT
-    else:
-        if state.phase == Phase.IDLE and "open" in out and "port" in out:
-            state.phase = Phase.RECON
-        elif state.phase == Phase.RECON and any(x in out for x in ["service", "version", "ssh", "http"]):
-            state.phase = Phase.SERVICE_ENUM
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
