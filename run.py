@@ -193,6 +193,77 @@ def _build_prompt(
     return result.messages
 
 
+# ── Python fallback synthesis ─────────────────────────────────────────────────
+
+async def _synthesise_fallback(
+    model, binary: str, failed_cmd: str, error: str, target: str, shell
+) -> str:
+    """When a CLI tool keeps failing, tool_operator writes Python to do the same job."""
+    from pentestgpt.prompts.mythos_prompts import SYSTEM_PROMPTS
+    import shutil as _shutil
+
+    synth_adapter = (
+        "tool_operator" if "tool_operator" in model.loaded_adapters()
+        else "executor"
+    )
+    _hdr(f"TOOL OPERATOR — synthesising Python fallback [{synth_adapter}]", synth_adapter)
+    _info(f"'{binary}' failed twice — writing Python 3 replacement")
+
+    installed = [t for t in [
+        "requests","urllib","socket","json","re","concurrent.futures","subprocess"
+    ]]  # always available in Python stdlib + venv
+
+    synth_prompt = (
+        f"Tool: {binary}\n"
+        f"Reason unavailable: '{binary}' failed twice with this error:\n{error[:400]}\n\n"
+        f"Goal: achieve what `{failed_cmd}` was trying to do, for target: {target}\n\n"
+        f"Write a complete, self-contained Python 3 script that:\n"
+        f"  - Accomplishes the same goal without the broken CLI tool\n"
+        f"  - Uses only: {', '.join(installed)}\n"
+        f"  - Prints all results to stdout\n"
+        f"  - Handles errors gracefully (timeouts, connection errors)\n\n"
+        f"Put the code inside a ```python ... ``` block."
+    )
+    msgs = [
+        {"role": "system", "content": SYSTEM_PROMPTS.get(synth_adapter, "")},
+        {"role": "user",   "content": synth_prompt},
+    ]
+    try:
+        resp = model.generate("executor", msgs, max_new_tokens=600)
+        import re as _re, tempfile, os as _os, sys as _sys
+        m = _re.search(r"```python\s*\n(.*?)```", resp, _re.DOTALL)
+        if not m:
+            return f"[Fallback synthesis failed — executor returned no Python block]\n{resp[:200]}"
+
+        code = m.group(1).strip()
+        workspace = str(Path(_sys.argv[0]).parent / "workspace")
+        Path(workspace).mkdir(exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", dir=workspace,
+            delete=False, prefix=f"mythos_{binary}_"
+        ) as f:
+            f.write(code)
+            script_path = f.name
+
+        _ok(f"Synthesised script: {script_path}")
+        print(f"\n{DIM}--- script preview ---{R}")
+        print("\n".join(f"    {l}" for l in code.splitlines()[:20]))
+        print(f"{DIM}--- end preview ---{R}\n")
+
+        exec_result = await shell.run(f"python3 {script_path}")
+        out = exec_result.stdout or exec_result.stderr or ""
+        if exec_result.exit_code == 0:
+            _ok(f"Python fallback succeeded ({len(out)} chars)")
+        else:
+            _warn(f"Python fallback also failed (exit={exec_result.exit_code})")
+        if out:
+            print("\n".join(f"    {l}" for l in out.splitlines()[:30]))
+        return out or f"[Python fallback for {binary} produced no output]"
+
+    except Exception as exc:
+        return f"[Fallback synthesis error: {exc}]"
+
+
 # ── Analyst extraction ────────────────────────────────────────────────────────
 
 def _analyst_extract(model, tool_output: str, target: str, max_tokens: int) -> dict:
@@ -243,9 +314,29 @@ async def run_engagement(args: argparse.Namespace) -> None:
     scope    = _load_scope(args.scope, args.target)
     knowledge = _load_knowledge(args.program, args.target) if (args.program or args.bug_bounty) else None
 
-    # ── Tool docs cache ───────────────────────────────────────────────────────
-    from pentestgpt.core.tool_docs import ToolDocsCache
-    _tool_docs = ToolDocsCache()
+    # ── Live tool introspection helper ────────────────────────────────────────
+    async def _live_help(binary: str) -> str:
+        """Run `binary --help` in the shell and return the output.
+
+        This is what a human would do when a tool fails — run the help directly
+        and read the actual installed version's flags. No caching, no guessing.
+        """
+        if not binary:
+            return ""
+        import shutil
+        if not shutil.which(binary):
+            return f"[{binary} is not installed on this system — cannot run {binary} --help]"
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                f"{binary} --help",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            output = (stdout or stderr or b"").decode("utf-8", errors="replace").strip()
+            return output[:3000]   # cap at 3000 chars — enough for any help page
+        except Exception as exc:
+            return f"[Could not run {binary} --help: {exc}]"
 
     # Register all loaded adapters with the router
     for name in model.loaded_adapters():
@@ -302,16 +393,11 @@ async def run_engagement(args: argparse.Namespace) -> None:
             col = _ac(adapter)
             print(f"  {B}ROUTER{R}  {col}{B}{adapter.upper()}{R}  {DIM}← {route_reason}{R}")
 
-            # ── 2. TOOL DOCS FETCH (lazy, cached) ─────────────────────────────
-            # Fetch docs for any tool mentioned in the current message so the model
-            # sees correct flags before generating the command.
-            loop = asyncio.get_event_loop()
-            try:
-                tool_docs_ctx = await _tool_docs.build_context(current_msg, loop)
-                if tool_docs_ctx:
-                    _info(f"Tool docs injected: {len(tool_docs_ctx)} chars")
-            except Exception:
-                tool_docs_ctx = ""
+            # ── 2. (no pre-generation doc injection) ──────────────────────────
+            # We do NOT pre-inject tool docs. The model should know what it's
+            # doing from training. If it generates a wrong command, the ACTUAL
+            # error output tells it exactly what failed — no cached guesses needed.
+            tool_docs_ctx = ""
 
             # ── 3. CONTEXT ASSEMBLY ───────────────────────────────────────────
             messages = _build_prompt(
@@ -430,29 +516,39 @@ async def run_engagement(args: argparse.Namespace) -> None:
                         "error: unknown", "usage:", "unknown command",
                     )
                     if not exit_ok and any(s in tool_output.lower() for s in _FLAG_ERROR_SIGNALS):
-                        if "executor" in model.loaded_adapters():
-                            _hdr("EXECUTOR — fixing flag error", "executor")
+                        # Prefer tool_operator (first-principles reasoning) over executor
+                        _correction_adapter = (
+                            "tool_operator" if "tool_operator" in model.loaded_adapters()
+                            else "executor"   if "executor"      in model.loaded_adapters()
+                            else None
+                        )
+                        if _correction_adapter:
+                            _hdr(f"TOOL OPERATOR — fixing flag error [{_correction_adapter}]", _correction_adapter)
                             from pentestgpt.prompts.mythos_prompts import SYSTEM_PROMPTS as _SP
                             binary = final_cmd.split()[0] if final_cmd else ""
-                            # Always fetch docs for the specific failing binary — this
-                            # ensures the _USAGE_NOTES (e.g. "gau takes positional arg,
-                            # not -d") reach the executor, regardless of what was fetched
-                            # for the previous generation step.
-                            try:
-                                binary_docs = _tool_docs.get(binary) if binary else ""
-                            except Exception:
-                                binary_docs = ""
-                            _info(f"Fetched live docs for '{binary}': {len(binary_docs)} chars")
-                            # Use the same prompt format the executor was trained on:
-                            # "Tool: X / Command attempted: Y / Error output: Z / Tool help:"
+
+                            # Run `binary --help` live — ground truth for this exact binary
+                            live_help = await _live_help(binary)
+                            _info(f"Live --help for '{binary}': {len(live_help)} chars")
+
+                            # List all installed tools so the operator can pick a better one
+                            import shutil as _shutil
+                            all_tools = [t for t in [
+                                "subfinder","amass","httpx","gau","katana","nuclei",
+                                "ffuf","nmap","dnsx","curl","sqlmap","gobuster",
+                                "feroxbuster","nikto","wfuzz","waybackurls","dnsx",
+                                "masscan","rustscan","dalfox","wpscan",
+                            ] if _shutil.which(t)]
+
                             corr_prompt = (
                                 f"Tool: {binary}\n"
                                 f"Command attempted: {final_cmd}\n\n"
                                 f"Error output:\n{tool_output[:800]}\n\n"
-                                f"Tool help (excerpt):\n{binary_docs[:1000] if binary_docs else '(not available)'}\n"
+                                f"Installed tools on this system: {', '.join(all_tools)}\n\n"
+                                f"Tool help (from running `{binary} --help` right now):\n{live_help}\n"
                             )
                             exec_msgs = [
-                                {"role": "system", "content": _SP.get("executor", "")},
+                                {"role": "system", "content": _SP.get(_correction_adapter, _SP.get("executor", ""))},
                                 {"role": "user",   "content": corr_prompt},
                             ]
                             try:
@@ -468,13 +564,17 @@ async def run_engagement(args: argparse.Namespace) -> None:
                                         _ok(f"Re-run exit=0  ({len(out2)} chars)")
                                         tool_output = out2 or f"[{final_cmd}] exited 0 but produced no output."
                                     else:
-                                        _warn(f"Re-run also failed (exit={exec_result2.exit_code}) — skipping tool")
-                                        tool_output = f"Both original and corrected commands failed.\nOriginal: {cmd}\nCorrected: {final_cmd}\nError: {out2[:300]}"
+                                        _warn(f"Re-run also failed — synthesising Python fallback")
+                                        tool_output = await _synthesise_fallback(
+                                            model, binary, final_cmd, out2, args.target, shell
+                                        )
                                     if out2:
                                         print("\n".join(f"    {l}" for l in out2.splitlines()[:30]))
                                 else:
-                                    _warn("Executor produced same command or no command — skipping tool")
-                                    tool_output = f"[SKIPPED] {final_cmd} failed and executor could not correct it.\nError: {tool_output[:300]}"
+                                    _warn("Executor produced same command — synthesising Python fallback")
+                                    tool_output = await _synthesise_fallback(
+                                        model, binary, final_cmd, tool_output, args.target, shell
+                                    )
                             except Exception as exc:
                                 _warn(f"Executor correction failed: {exc}")
                 except Exception as exc:
