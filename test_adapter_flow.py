@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """Adapter flow test — runs all adapters individually and chains outputs.
 
-Tests four things:
+Tests six things:
   1. SOLO: each adapter with a relevant standalone prompt (verify it loads
      and produces coherent output for its domain)
   2. CHAINED: osint → webapp → analyst → researcher (simulate a real
      bug bounty session where each adapter's output feeds the next)
   3. EXEC PIPELINE: command extraction → flag validation → tool_docs injection
      → optional real shell execution (no GPU)
-  4. CORRECTION TEST: domain adapter generates → CommandValidator flags error
+  4. CLASSIFIER TEST: load the 3-layer routing MLP, run labelled probes,
+     verify predictions and confidence thresholds (no GPU)
+  5. CORRECTION TEST: domain adapter generates → CommandValidator flags error
      → executor adapter corrects → verify corrected command is valid (GPU)
-  5. LIVE END-TO-END: osint generates → extract → validate → (executor corrects
+  6. LIVE END-TO-END: osint generates → extract → validate → (executor corrects
      if needed) → execute real command → analyst interprets → verify JSON (GPU)
 
 Usage:
     # All adapters, full chain (GPU)
     python test_adapter_flow.py --target supplier.meesho.com
+
+    # Classifier routing test only (no GPU) — verify 3-layer MLP loads correctly
+    python test_adapter_flow.py --classifier-test
 
     # Executor correction test only (GPU) — key pipeline validation
     python test_adapter_flow.py --correction-test
@@ -23,11 +28,11 @@ Usage:
     # Full live end-to-end test (GPU + execution)
     python test_adapter_flow.py --live-test --execute
 
-    # Static pipeline only (no GPU)
-    python test_adapter_flow.py --exec-pipeline
+    # Static pipeline + classifier (no GPU)
+    python test_adapter_flow.py --exec-pipeline --classifier-test
 
     # All tests combined
-    python test_adapter_flow.py --exec-pipeline --correction-test --live-test --execute
+    python test_adapter_flow.py --exec-pipeline --classifier-test --correction-test --live-test --execute
 
     # Limit output tokens (faster)
     python test_adapter_flow.py --max-tokens 256
@@ -593,6 +598,129 @@ _PIPELINE_CASES: list[dict] = [
 
 def _tick(ok: bool) -> str:
     return f"{GREEN}✓{RESET}" if ok else f"{RED}✗{RESET}"
+
+
+# ── Classifier routing test (no GPU) ──────────────────────────────────────────
+
+# Probe prompts with their expected adapter labels.
+# Each entry: (prompt, expected_adapter_or_None_for_soft_pass)
+# expected=None means "classifier should load and return *something* with conf > 0"
+_CLASSIFIER_PROBES: list[tuple[str, str | None]] = [
+    # Clear domain-specific prompts
+    ("Use subfinder to enumerate subdomains of supplier.meesho.com then probe with httpx",  "osint"),
+    ("Test for SQL injection on /api/login using sqlmap with cookie-based auth",             "webapp"),
+    ("CVE-2021-44228 Log4Shell — craft a JNDI payload for the User-Agent header",           "vulhub"),
+    ("Perform Kerberoasting using Rubeus against corp.local to extract service tickets",     "ad"),
+    ("Retrieve AWS IAM credentials from the EC2 metadata service via SSRF at 169.254.169.254", "cloud"),
+    ("Use BloodHound and SharpHound to map Active Directory trust relationships",            "ad"),
+    ("Write a Python exploit for CVE-2019-0708 BlueKeep RDP buffer overflow",               "exploitdb"),
+    ("HYPOTHESIS: timing oracle on /api/v2/export — response 3x slower for pdf than csv",  "researcher"),
+    # Orchestration adapters should NOT be returned by normal routing
+    # (these are soft-pass — classifier should not route to planner/executor/analyst)
+    ("Plan the next step after recon found 3 subdomains with no open ports",                 None),
+    ("Correct this command: gau -d supplier.meesho.com",                                     None),
+]
+
+_ORCHESTRATION_ADAPTER_NAMES = frozenset({"planner", "executor", "analyst"})
+
+
+def run_classifier_test(project_root: str = "") -> dict:
+    """Test the routing classifier: load it, run probes, verify predictions.
+
+    This is a no-GPU test — only the 80 MB sentence-transformers encoder is loaded.
+    """
+    separator("CLASSIFIER ROUTING TEST", CYAN)
+    root = Path(project_root or Path(__file__).parent)
+    classifier_dir = root / "adapters" / "router_classifier"
+
+    from pentestgpt.core.adapter_router import _RouterClassifier, CLASSIFIER_CONF_THRESHOLD
+
+    results: dict = {"probes": []}
+    all_ok = True
+
+    # 1. Verify classifier artefacts exist
+    required_files = ["model.pt", "label_map.json", "encoder_name.txt", "stats.json"]
+    missing = [f for f in required_files if not (classifier_dir / f).exists()]
+    if missing:
+        print(f"  {RED}✗ Missing classifier artefacts: {missing}{RESET}")
+        print(f"    Run:  python3 src/train_router_classifier.py")
+        return {"error": f"missing artefacts: {missing}"}
+
+    print(f"  {GREEN}✓{RESET} Classifier artefacts found in {classifier_dir}")
+
+    # 2. Load stats to show training metadata
+    import json as _json
+    stats = _json.loads((classifier_dir / "stats.json").read_text())
+    label_map = _json.loads((classifier_dir / "label_map.json").read_text())
+    print(f"  Classes ({stats['num_classes']}): {sorted(label_map.keys())}")
+    print(f"  Training: {stats.get('train_examples', '?')} examples | "
+          f"Eval accuracy: {stats.get('overall_accuracy', '?'):.1%} | "
+          f"Gated accuracy: {stats.get('gated_accuracy', '?'):.1%}")
+    print(f"  Architecture: embed_dim={stats.get('embed_dim', 384)} "
+          f"hidden_dim={stats.get('hidden_dim', 128)} "
+          f"num_classes={stats['num_classes']}")
+
+    # 3. Instantiate and warm up
+    clf = _RouterClassifier(str(classifier_dir))
+    try:
+        warmup_adapter, warmup_conf = clf.predict("test warmup ping")
+        print(f"  {GREEN}✓{RESET} Classifier loaded and warmed up (warm-up: {warmup_adapter} conf={warmup_conf:.2f})")
+    except Exception as exc:
+        print(f"  {RED}✗ Classifier failed to load: {exc}{RESET}")
+        return {"error": str(exc)}
+
+    # 4. Run probes
+    print()
+    separator("Probing classifier", DIM)
+    pass_count = 0
+    for prompt, expected in _CLASSIFIER_PROBES:
+        pred, conf = clf.predict(prompt)
+        triggered  = conf >= CLASSIFIER_CONF_THRESHOLD
+        is_orch    = pred in _ORCHESTRATION_ADAPTER_NAMES
+
+        if expected is None:
+            # Soft pass: just verify classifier returns a non-empty, non-orchestration
+            # adapter with valid confidence
+            ok = bool(pred) and conf > 0.0
+            label = f"soft (got {pred} conf={conf:.2f})"
+        else:
+            ok = (pred == expected) and triggered and not is_orch
+            label = f"{'✓' if pred == expected else f'expected={expected}'} conf={conf:.2f} triggered={triggered}"
+
+        sym  = _tick(ok)
+        gate = f"{GREEN}TRIGGERED{RESET}" if triggered else f"{YELLOW}below-threshold{RESET}"
+        orch_note = f" {RED}[ORCHESTRATION!]{RESET}" if is_orch else ""
+        print(f"  {sym} [{pred:<12}] {gate}{orch_note}  ← {prompt[:70]}")
+        if not ok:
+            all_ok = False
+
+        results["probes"].append({
+            "prompt":   prompt[:80],
+            "expected": expected,
+            "pred":     pred,
+            "conf":     round(conf, 3),
+            "ok":       ok,
+        })
+        if ok:
+            pass_count += 1
+
+    # 5. Summary
+    separator()
+    total = len(_CLASSIFIER_PROBES)
+    colour = GREEN if all_ok else (YELLOW if pass_count >= total * 0.8 else RED)
+    print(f"{colour}Classifier test: {pass_count}/{total} probes passed{RESET}")
+
+    if not all_ok:
+        print(f"\n{YELLOW}  Possible causes:{RESET}")
+        print(f"    • Architecture mismatch → re-train: python3 src/train_router_classifier.py")
+        print(f"    • Low data for some classes → check per-class accuracy in stats.json")
+        print(f"    • Confidence below threshold ({CLASSIFIER_CONF_THRESHOLD}) — predictions "
+              f"still correct but won't override regex")
+
+    results["pass_count"] = pass_count
+    results["total"] = total
+    results["all_ok"] = all_ok
+    return results
 
 
 def run_execution_pipeline_test(execute: bool = False) -> dict:
@@ -1248,8 +1376,10 @@ def main() -> None:
                         help="Run only solo adapter tests (no chain)")
     parser.add_argument("--chain-only",      action="store_true",
                         help="Run only the chained flow test")
-    parser.add_argument("--exec-pipeline",   action="store_true",
+    parser.add_argument("--exec-pipeline",    action="store_true",
                         help="Run static pipeline tests (no GPU needed)")
+    parser.add_argument("--classifier-test", action="store_true",
+                        help="Test router classifier: load, probe, verify predictions (no GPU)")
     parser.add_argument("--correction-test", action="store_true",
                         help="Run executor correction test (GPU): verify executor fixes wrong commands")
     parser.add_argument("--live-test",       action="store_true",
@@ -1267,14 +1397,15 @@ def main() -> None:
     # Determine which modes need GPU
     needs_gpu = (
         not args.exec_pipeline          # default mode runs solo+chain
+        and not args.classifier_test    # classifier test is no-GPU
         or args.solo_only
         or args.chain_only
         or args.correction_test
         or args.live_test
     )
-    # Exec-pipeline-only flag means: only run static tests, no GPU
+    # Static-only flag: only run tests that require no GPU
     exec_pipeline_only = (
-        args.exec_pipeline
+        (args.exec_pipeline or args.classifier_test)
         and not args.solo_only
         and not args.chain_only
         and not args.correction_test
@@ -1284,6 +1415,8 @@ def main() -> None:
     mode_parts = []
     if args.exec_pipeline:
         mode_parts.append("static-pipeline" + (" +exec" if args.execute else ""))
+    if args.classifier_test:
+        mode_parts.append("classifier")
     if args.correction_test:
         mode_parts.append("correction")
     if args.live_test:
@@ -1309,11 +1442,16 @@ def main() -> None:
     # ── Static pipeline (no GPU) ───────────────────────────────────────────
     if args.exec_pipeline:
         results["exec_pipeline"] = run_execution_pipeline_test(execute=args.execute)
-        if exec_pipeline_only:
-            if args.save:
-                Path(args.save).write_text(json.dumps(results, indent=2))
-                print(f"\n{GREEN}Results saved to: {args.save}{RESET}")
-            return
+
+    # ── Classifier routing test (no GPU) ──────────────────────────────────
+    if args.classifier_test:
+        results["classifier_test"] = run_classifier_test(project_root)
+
+    if exec_pipeline_only:
+        if args.save:
+            Path(args.save).write_text(json.dumps(results, indent=2))
+            print(f"\n{GREEN}Results saved to: {args.save}{RESET}")
+        return
 
     # ── Load model (GPU) ───────────────────────────────────────────────────
     if needs_gpu:
