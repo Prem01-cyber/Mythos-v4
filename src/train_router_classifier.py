@@ -40,13 +40,14 @@ DATA_PATH   = Path("raw/router_labels.jsonl")
 OUTPUT_DIR  = Path("adapters/router_classifier")
 ENCODER_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBED_DIM   = 384
-HIDDEN_DIM  = 128
-EPOCHS      = 8
+HIDDEN_DIM  = 256    # wider hidden layer for better separation across 12+ classes
+EPOCHS      = 15     # more epochs since the MLP head is small and fast
 BATCH_SIZE  = 64
-LR          = 3e-4
+LR          = 2e-4
 EVAL_SPLIT  = 0.15
 SEED        = 42
 CONF_THRESHOLD = 0.70  # minimum confidence for classifier to override regex
+LABEL_SMOOTH   = 0.05  # prevents over-confident predictions on ambiguous prompts
 
 # ── Mean pooling for CLS-less models ─────────────────────────────────────────
 
@@ -58,13 +59,22 @@ def mean_pool(token_embeddings: torch.Tensor, attention_mask: torch.Tensor) -> t
 # ── MLP head ──────────────────────────────────────────────────────────────────
 
 class RouterHead(nn.Module):
+    """3-layer MLP: 384 → 256 → 128 → num_classes.
+
+    Deeper than the original 2-layer version for better separation when
+    12+ adapter classes are present, while still training in under 5 minutes.
+    """
     def __init__(self, in_dim: int, hidden: int, num_classes: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
-            nn.ReLU(),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden, num_classes),
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Dropout(0.05),
+            nn.Linear(hidden // 2, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -202,8 +212,13 @@ def main() -> None:
         print(f"Loaded model from {model_path}")
     else:
         # ── Training loop ─────────────────────────────────────────────────────
-        optimizer = optim.AdamW(head.parameters(), lr=args.lr)
-        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.AdamW(head.parameters(), lr=args.lr, weight_decay=1e-4)
+        # Label smoothing: slightly reduces overconfidence on near-boundary examples.
+        # When a new adapter is added later, existing class boundaries stay stable.
+        criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=1e-5
+        )
 
         train_dataset = RouterDataset(
             list(range(len(train_emb))), train_labels
@@ -223,14 +238,18 @@ def main() -> None:
                 logits = head(emb_batch)
                 loss   = criterion(logits, lbl_batch)
                 loss.backward()
+                nn.utils.clip_grad_norm_(head.parameters(), max_norm=1.0)
                 optimizer.step()
 
                 total_loss += loss.item() * len(lbl_batch)
                 correct    += (logits.argmax(1) == lbl_batch).sum().item()
 
-            avg_loss = total_loss / len(train_prompts)
+            scheduler.step()
+            avg_loss  = total_loss / len(train_prompts)
             train_acc = correct / len(train_prompts)
-            print(f"  Epoch {epoch}/{args.epochs}  loss={avg_loss:.4f}  train_acc={train_acc:.3f}")
+            lr_now    = scheduler.get_last_lr()[0]
+            print(f"  Epoch {epoch:>2}/{args.epochs}  loss={avg_loss:.4f}  "
+                  f"train_acc={train_acc:.3f}  lr={lr_now:.2e}")
 
     # ── Evaluation ─────────────────────────────────────────────────────────────
     head.eval()

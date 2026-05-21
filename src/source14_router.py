@@ -35,30 +35,64 @@ OUTPUT_PATH   = Path("raw/router_labels.jsonl")
 # How many user-turn prompts to sample per processed file (pool A)
 POOL_A_PER_FILE = 150
 
-# Adapter label for each processed file
-FILE_TO_ADAPTER: dict[str, str] = {
-    "htb_writeups.jsonl":   "htb",
-    "vulhub.jsonl":         "vulhub",
-    "attack.jsonl":         "attack",
-    "ad.jsonl":             "ad",
-    "webapp.jsonl":         "webapp",
-    "osint.jsonl":          "osint",
-    "cloud.jsonl":          "cloud",
-    "exploitdb.jsonl":      "exploitdb",
-    "researcher.jsonl":     "researcher",
-    "researcher_synth.jsonl":  "researcher",
-    "researcher_pz.jsonl":     "researcher",
-    "researcher_ctf.jsonl":    "researcher",
-    "planner.jsonl":        "planner",
-    "planner_decomp.jsonl": "planner",
-    "planner_replan.jsonl": "planner",
-    "executor.jsonl":       "executor",
-    "executor_correction.jsonl": "executor",
-    "executor_filtering.jsonl":  "executor",
-    "analyst.jsonl":        "analyst",
-    "analyst_h1.jsonl":     "analyst",
-    "analyst_synth.jsonl":  "analyst",
+# Explicit file→adapter mapping for files whose adapter isn't obvious from the name.
+# For all other files in processed/, the adapter is inferred from the filename stem
+# (e.g. webapp.jsonl → webapp, executor_correction.jsonl → executor).
+# New adapters are picked up automatically as long as their processed files exist.
+_EXPLICIT_FILE_TO_ADAPTER: dict[str, str] = {
+    "htb_writeups.jsonl":     "htb",
 }
+
+# Known adapter names — used to validate auto-inferred labels.
+# Extend this list when a new adapter is added; auto-discovery will handle the rest.
+KNOWN_ADAPTERS: set[str] = {
+    "htb", "vulhub", "attack", "exploitdb", "ad",
+    "webapp", "osint", "cloud",
+    "executor", "analyst", "planner", "researcher",
+}
+
+
+def _build_file_to_adapter(processed_dir: Path) -> dict[str, str]:
+    """
+    Build the file→adapter mapping dynamically from processed/*.jsonl.
+
+    Rules (applied in order):
+      1. Explicit override from _EXPLICIT_FILE_TO_ADAPTER
+      2. Stem prefix matches a known adapter name
+         (e.g. executor_correction → executor, analyst_h1 → analyst)
+      3. Full stem matches a known adapter name exactly
+
+    Unknown files (no matching adapter) are skipped with a warning, so new
+    adapters are included automatically as soon as their processed JSONL exists.
+    """
+    mapping: dict[str, str] = {}
+    for p in sorted(processed_dir.glob("*.jsonl")):
+        fname = p.name
+        stem  = p.stem   # filename without .jsonl
+
+        # Rule 1: explicit override
+        if fname in _EXPLICIT_FILE_TO_ADAPTER:
+            mapping[fname] = _EXPLICIT_FILE_TO_ADAPTER[fname]
+            continue
+
+        # Rule 2 / 3: infer from stem
+        matched: str | None = None
+        # Exact match first
+        if stem in KNOWN_ADAPTERS:
+            matched = stem
+        else:
+            # Prefix match: "executor_correction" → "executor"
+            for adapter in KNOWN_ADAPTERS:
+                if stem.startswith(adapter):
+                    matched = adapter
+                    break
+
+        if matched:
+            mapping[fname] = matched
+        else:
+            print(f"  [skip] {fname} — no adapter match (add to KNOWN_ADAPTERS if new)")
+
+    return mapping
 
 # ── Pool B: synthetic ambiguous / hard cases ─────────────────────────────────
 # These are cases where the regex router either ties or picks wrong.
@@ -221,13 +255,15 @@ def build_dataset(seed: int = 42) -> list[dict]:
     random.seed(seed)
     dataset: list[dict] = []
 
-    # Pool A — extract from processed files
-    for filename, adapter in FILE_TO_ADAPTER.items():
+    # Pool A — extract from processed files (auto-discovered)
+    file_to_adapter = _build_file_to_adapter(PROCESSED_DIR)
+    print(f"Pool A: found {len(file_to_adapter)} processed files → adapters: "
+          f"{sorted(set(file_to_adapter.values()))}")
+    for filename, adapter in file_to_adapter.items():
         path = PROCESSED_DIR / filename
-        if not path.exists():
-            continue
         examples = _extract_user_turns(path, adapter, POOL_A_PER_FILE)
         dataset.extend(examples)
+        print(f"  {filename:<35} → {adapter:<12} ({len(examples)} examples)")
 
     # Pool B — hand-crafted ambiguous cases (repeat 3x with minor variation)
     for prompt, adapter in AMBIGUOUS_CASES:
