@@ -167,6 +167,7 @@ def _build_prompt(
     knowledge,
     model,
     mode:       str,
+    tool_docs_ctx: str = "",
 ) -> list[dict]:
     """Assemble context using ContextBudgetManager — same as mythos_backend."""
     from pentestgpt.core.context_manager import ContextBudgetManager, CONTEXT_LIMIT
@@ -185,8 +186,9 @@ def _build_prompt(
         scope_context    = scope_ctx,
         current_turn     = user_msg,
         engagement_state = state_ctx,
-        history          = history[-8:],   # last 4 turns max passed to assembler
+        history          = history[-8:],
         knowledge        = know_ctx,
+        tool_docs        = tool_docs_ctx,
     )
     return result.messages
 
@@ -240,6 +242,10 @@ async def run_engagement(args: argparse.Namespace) -> None:
     router   = _load_router(project_root)
     scope    = _load_scope(args.scope, args.target)
     knowledge = _load_knowledge(args.program, args.target) if (args.program or args.bug_bounty) else None
+
+    # ── Tool docs cache ───────────────────────────────────────────────────────
+    from pentestgpt.core.tool_docs import ToolDocsCache
+    _tool_docs = ToolDocsCache()
 
     # Register all loaded adapters with the router
     for name in model.loaded_adapters():
@@ -296,17 +302,28 @@ async def run_engagement(args: argparse.Namespace) -> None:
             col = _ac(adapter)
             print(f"  {B}ROUTER{R}  {col}{B}{adapter.upper()}{R}  {DIM}← {route_reason}{R}")
 
-            # ── 2. CONTEXT ASSEMBLY ───────────────────────────────────────────
+            # ── 2. TOOL DOCS FETCH (lazy, cached) ─────────────────────────────
+            # Fetch docs for any tool mentioned in the current message so the model
+            # sees correct flags before generating the command.
+            loop = asyncio.get_event_loop()
+            try:
+                tool_docs_ctx = await _tool_docs.build_context(current_msg, loop)
+                if tool_docs_ctx:
+                    _info(f"Tool docs injected: {len(tool_docs_ctx)} chars")
+            except Exception:
+                tool_docs_ctx = ""
+
+            # ── 3. CONTEXT ASSEMBLY ───────────────────────────────────────────
             messages = _build_prompt(
                 adapter=adapter, state=state, history=history,
                 user_msg=current_msg, scope=scope, knowledge=knowledge,
-                model=model, mode=mode_str,
+                model=model, mode=mode_str, tool_docs_ctx=tool_docs_ctx,
             )
             total_ctx_tokens = sum(model.count_tokens(m.get("content","")) for m in messages)
             _info(f"Context: {len(messages)} messages, {total_ctx_tokens} tokens")
             _info(f"User turn preview: {current_msg[:120].replace(chr(10),' ')}…")
 
-            # ── 3. GENERATION ─────────────────────────────────────────────────
+            # ── 4. GENERATION ─────────────────────────────────────────────────
             print(f"\n  {col}{B}Generating [{adapter}]…{R}")
             t0 = time.time()
             try:
@@ -322,7 +339,7 @@ async def run_engagement(args: argparse.Namespace) -> None:
             resp_preview = response[:600] + (f"\n  {DIM}[…{len(response)-600} chars truncated]{R}" if len(response) > 600 else "")
             print(f"\n{resp_preview}\n")
 
-            # ── 4. COMMAND EXTRACTION ─────────────────────────────────────────
+            # ── 5. COMMAND EXTRACTION ─────────────────────────────────────────
             from pentestgpt.core.tool_executor import ShellExecutor as _SE
             _tmp_shell = _SE(workspace=str(Path(project_root) / "workspace"))
             raw_cmds = _tmp_shell.extract_commands(response)
@@ -401,6 +418,10 @@ async def run_engagement(args: argparse.Namespace) -> None:
                         print("\n".join(f"    {l}" for l in lines[:40]))
                         if len(lines) > 40:
                             _info(f"[…{len(lines)-40} more lines]")
+                    elif exit_ok:
+                        # exit=0 but no output — be explicit so model doesn't hallucinate
+                        _warn("Command succeeded but produced NO output (tool found nothing or output was empty)")
+                        tool_output = f"[{final_cmd}] exited 0 but produced no output. The tool found nothing or output was suppressed."
 
                     # ── Post-execution correction via executor ─────────────────
                     _FLAG_ERROR_SIGNALS = (
@@ -412,11 +433,23 @@ async def run_engagement(args: argparse.Namespace) -> None:
                         if "executor" in model.loaded_adapters():
                             _hdr("EXECUTOR — fixing flag error", "executor")
                             from pentestgpt.prompts.mythos_prompts import SYSTEM_PROMPTS as _SP
+                            binary = final_cmd.split()[0] if final_cmd else ""
+                            # Always fetch docs for the specific failing binary — this
+                            # ensures the _USAGE_NOTES (e.g. "gau takes positional arg,
+                            # not -d") reach the executor, regardless of what was fetched
+                            # for the previous generation step.
+                            try:
+                                binary_docs = _tool_docs.get(binary) if binary else ""
+                            except Exception:
+                                binary_docs = ""
+                            _info(f"Fetched live docs for '{binary}': {len(binary_docs)} chars")
+                            # Use the same prompt format the executor was trained on:
+                            # "Tool: X / Command attempted: Y / Error output: Z / Tool help:"
                             corr_prompt = (
-                                f"Command: {final_cmd}\n\n"
-                                f"Error output:\n{tool_output[:600]}\n\n"
-                                f"The command failed due to an invalid flag or wrong syntax. "
-                                f"Generate the corrected command inside <command> tags."
+                                f"Tool: {binary}\n"
+                                f"Command attempted: {final_cmd}\n\n"
+                                f"Error output:\n{tool_output[:800]}\n\n"
+                                f"Tool help (excerpt):\n{binary_docs[:1000] if binary_docs else '(not available)'}\n"
                             )
                             exec_msgs = [
                                 {"role": "system", "content": _SP.get("executor", "")},
@@ -424,19 +457,26 @@ async def run_engagement(args: argparse.Namespace) -> None:
                             ]
                             try:
                                 corr_resp = model.generate("executor", exec_msgs, max_new_tokens=256)
+                                # extract_commands handles <command>, <corrected>, and ```bash blocks
                                 corr_cmds = _tmp_shell.extract_commands(corr_resp)
-                                if corr_cmds:
+                                if corr_cmds and corr_cmds[0] != final_cmd:
                                     _ok(f"Executor corrected → {corr_cmds[0]}")
-                                    # Re-run corrected command
                                     exec_result2 = await shell.run(corr_cmds[0])
-                                    tool_output  = exec_result2.stdout or exec_result2.stderr or ""
-                                    final_cmd    = corr_cmds[0]
-                                    _ok(f"Re-run exit={exec_result2.exit_code}  ({len(tool_output)} chars)")
-                                    if tool_output:
-                                        lines2 = tool_output.splitlines()
-                                        print("\n".join(f"    {l}" for l in lines2[:30]))
+                                    out2 = exec_result2.stdout or exec_result2.stderr or ""
+                                    final_cmd = corr_cmds[0]
+                                    if exec_result2.exit_code == 0:
+                                        _ok(f"Re-run exit=0  ({len(out2)} chars)")
+                                        tool_output = out2 or f"[{final_cmd}] exited 0 but produced no output."
+                                    else:
+                                        _warn(f"Re-run also failed (exit={exec_result2.exit_code}) — skipping tool")
+                                        tool_output = f"Both original and corrected commands failed.\nOriginal: {cmd}\nCorrected: {final_cmd}\nError: {out2[:300]}"
+                                    if out2:
+                                        print("\n".join(f"    {l}" for l in out2.splitlines()[:30]))
+                                else:
+                                    _warn("Executor produced same command or no command — skipping tool")
+                                    tool_output = f"[SKIPPED] {final_cmd} failed and executor could not correct it.\nError: {tool_output[:300]}"
                             except Exception as exc:
-                                _warn(f"Executor re-run failed: {exc}")
+                                _warn(f"Executor correction failed: {exc}")
                 except Exception as exc:
                     _err(f"Execution error: {exc}")
                     tool_output = f"ERROR: {exc}"
