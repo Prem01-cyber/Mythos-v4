@@ -32,6 +32,9 @@ import time
 import warnings
 from pathlib import Path
 
+# ── Tool-runtime imports (lazy — only materialise when needed) ────────────────
+# These are resolved at runtime after sys.path is set (mythos_engine added below)
+
 # ── Silence noisy transformers warnings before any import touches them ────────
 warnings.filterwarnings("ignore", category=FutureWarning,  module="transformers")
 warnings.filterwarnings("ignore", category=UserWarning,    module="transformers")
@@ -351,13 +354,27 @@ async def run_engagement(args: argparse.Namespace) -> None:
     # ── Tool executor (if --execute) ──────────────────────────────────────────
     shell = None
     validator = None
+    workspace = str(Path(project_root) / "workspace")
+    Path(workspace).mkdir(exist_ok=True)
     if args.execute:
         from pentestgpt.core.tool_executor    import ShellExecutor
         from pentestgpt.core.command_validator import CommandValidator
-        workspace = str(Path(project_root) / "workspace")
-        Path(workspace).mkdir(exist_ok=True)
         shell     = ShellExecutor(workspace=workspace, timeout=args.execution_timeout)
         validator = CommandValidator()
+
+    # ── Tool Runtime Layer initialisation ─────────────────────────────────────
+    from pentestgpt.tools.env_manifest      import get_manifest
+    from pentestgpt.tools.dispatcher        import ToolDispatcher, DispatchContext
+    from pentestgpt.core.execution_policy   import ExecutionPolicy
+    from pentestgpt.core.observation        import ObservationSummarizer
+
+    _hdr("ENVIRONMENT MANIFEST", "")
+    _manifest = get_manifest(rebuild=True)
+    _info(_manifest.context_block())
+
+    _dispatcher  = ToolDispatcher()
+    _policy      = ExecutionPolicy()
+    _obs         = ObservationSummarizer(workspace=workspace)
 
     # ── Initial prompt ────────────────────────────────────────────────────────
     history: list[dict] = []
@@ -393,11 +410,10 @@ async def run_engagement(args: argparse.Namespace) -> None:
             col = _ac(adapter)
             print(f"  {B}ROUTER{R}  {col}{B}{adapter.upper()}{R}  {DIM}← {route_reason}{R}")
 
-            # ── 2. (no pre-generation doc injection) ──────────────────────────
-            # We do NOT pre-inject tool docs. The model should know what it's
-            # doing from training. If it generates a wrong command, the ACTUAL
-            # error output tells it exactly what failed — no cached guesses needed.
-            tool_docs_ctx = ""
+            # ── 2. ENV MANIFEST injection (tool collision awareness) ──────────
+            # Compact manifest block (~150 tokens) tells the model which binaries
+            # are installed and whether httpx is the Python client or PD binary.
+            tool_docs_ctx = _manifest.context_block()
 
             # ── 3. CONTEXT ASSEMBLY ───────────────────────────────────────────
             messages = _build_prompt(
@@ -425,12 +441,19 @@ async def run_engagement(args: argparse.Namespace) -> None:
             resp_preview = response[:600] + (f"\n  {DIM}[…{len(response)-600} chars truncated]{R}" if len(response) > 600 else "")
             print(f"\n{resp_preview}\n")
 
-            # ── 5. COMMAND EXTRACTION ─────────────────────────────────────────
-            from pentestgpt.core.tool_executor import ShellExecutor as _SE
-            _tmp_shell = _SE(workspace=str(Path(project_root) / "workspace"))
-            raw_cmds = _tmp_shell.extract_commands(response)
+            # ── 5. COMMAND EXTRACTION (via ToolDispatcher) ────────────────────
+            _disp_ctx = DispatchContext(
+                model_response=response,
+                target=args.target,
+                workspace=workspace,
+                model=model if args.execute else None,
+            )
 
-            if not raw_cmds:
+            # Extract commands to check for null step
+            _preview_cmds = _dispatcher._extract_commands(response)
+            _preview_py   = _dispatcher._extract_python(response)
+
+            if not _preview_cmds and not _preview_py:
                 _warn("No <command> tag found in response — null step")
                 null_step_count += 1
                 # After 1 null step — ask planner for redirection
@@ -450,192 +473,114 @@ async def run_engagement(args: argparse.Namespace) -> None:
                     try:
                         plan_response = model.generate("planner", planner_msgs, max_new_tokens=args.max_tokens)
                         print(f"\n{plan_response[:400]}\n")
-                        current_msg  = plan_response
+                        current_msg   = plan_response
                         null_step_count = 0
                     except Exception as exc:
                         _warn(f"Planner failed: {exc}")
-                        current_msg = current_msg   # retry same
                 elif null_step_count >= 3:
                     _warn("3 consecutive null steps — pausing. Check model output above.")
                     null_step_count = 0
                 else:
-                    # Model gave text but no command — feed its analysis back as context
                     current_msg = response[:600]
                 history.append({"role": "user",      "content": current_msg})
                 history.append({"role": "assistant", "content": response})
                 continue
 
             null_step_count = 0
-            cmd = raw_cmds[0]   # execute the first extracted command
+            print(f"\n  {B}COMMANDS{R}  {YEL}{', '.join(_preview_cmds[:3])}{R}\n")
 
-            # ── 5. PLACEHOLDER / FABRICATION CHECK + POST-EXEC CORRECTION ────────
-            # We do NOT pre-validate flags — the flag-set validator has too many
-            # false positives (subfinder -silent, projectdiscovery httpx flags, etc.)
-            # because help output formats vary. Instead we:
-            #   a) block literal placeholders (YOUR_TARGET, <IP>, etc.)
-            #   b) block fabricated echo "output" commands
-            #   c) after execution, if exit_code != 0, route error to executor
-            final_cmd = cmd
-            if _tmp_shell._has_placeholder(final_cmd):
-                _warn(f"Placeholder detected in command — skipping: {final_cmd}")
-                history.append({"role": "user",      "content": current_msg})
-                history.append({"role": "assistant", "content": response})
-                current_msg = (
-                    f"The command you generated contains an unfilled placeholder: {final_cmd}\n"
-                    f"Replace all placeholders (<TARGET>, YOUR_DOMAIN, etc.) with the actual "
-                    f"target: {args.target}. Generate the corrected command."
-                )
-                continue
-
-            print(f"\n  {B}COMMAND{R}  {YEL}{final_cmd}{R}\n")
-
-            # ── 6. EXECUTION ──────────────────────────────────────────────────
-            tool_output = ""
-            if shell:
-                _hdr(f"EXECUTING", "")
-                try:
-                    exec_result = await shell.run(final_cmd)
-                    tool_output = exec_result.stdout or exec_result.stderr or ""
-                    exit_ok = exec_result.exit_code == 0
-                    sym = _ok if exit_ok else _warn
-                    sym(f"exit={exec_result.exit_code}  ({len(tool_output)} chars output)")
-                    if tool_output:
-                        lines = tool_output.splitlines()
-                        print("\n".join(f"    {l}" for l in lines[:40]))
-                        if len(lines) > 40:
-                            _info(f"[…{len(lines)-40} more lines]")
-                    elif exit_ok:
-                        # exit=0 but no output — be explicit so model doesn't hallucinate
-                        _warn("Command succeeded but produced NO output (tool found nothing or output was empty)")
-                        tool_output = f"[{final_cmd}] exited 0 but produced no output. The tool found nothing or output was suppressed."
-
-                    # ── Post-execution correction via executor ─────────────────
-                    _FLAG_ERROR_SIGNALS = (
-                        "unknown flag", "unknown shorthand flag", "flag provided but not defined",
-                        "unrecognized option", "invalid option", "no such option",
-                        "error: unknown", "usage:", "unknown command",
-                    )
-                    if not exit_ok and any(s in tool_output.lower() for s in _FLAG_ERROR_SIGNALS):
-                        # Prefer tool_operator (first-principles reasoning) over executor
-                        _correction_adapter = (
-                            "tool_operator" if "tool_operator" in model.loaded_adapters()
-                            else "executor"   if "executor"      in model.loaded_adapters()
-                            else None
-                        )
-                        if _correction_adapter:
-                            _hdr(f"TOOL OPERATOR — fixing flag error [{_correction_adapter}]", _correction_adapter)
-                            from pentestgpt.prompts.mythos_prompts import SYSTEM_PROMPTS as _SP
-                            binary = final_cmd.split()[0] if final_cmd else ""
-
-                            # Run `binary --help` live — ground truth for this exact binary
-                            live_help = await _live_help(binary)
-                            _info(f"Live --help for '{binary}': {len(live_help)} chars")
-
-                            # List all installed tools so the operator can pick a better one
-                            import shutil as _shutil
-                            all_tools = [t for t in [
-                                "subfinder","amass","httpx","gau","katana","nuclei",
-                                "ffuf","nmap","dnsx","curl","sqlmap","gobuster",
-                                "feroxbuster","nikto","wfuzz","waybackurls","dnsx",
-                                "masscan","rustscan","dalfox","wpscan",
-                            ] if _shutil.which(t)]
-
-                            corr_prompt = (
-                                f"Tool: {binary}\n"
-                                f"Command attempted: {final_cmd}\n\n"
-                                f"Error output:\n{tool_output[:800]}\n\n"
-                                f"Installed tools on this system: {', '.join(all_tools)}\n\n"
-                                f"Tool help (from running `{binary} --help` right now):\n{live_help}\n"
-                            )
-                            exec_msgs = [
-                                {"role": "system", "content": _SP.get(_correction_adapter, _SP.get("executor", ""))},
-                                {"role": "user",   "content": corr_prompt},
-                            ]
-                            try:
-                                corr_resp = model.generate("executor", exec_msgs, max_new_tokens=256)
-                                # extract_commands handles <command>, <corrected>, and ```bash blocks
-                                corr_cmds = _tmp_shell.extract_commands(corr_resp)
-                                if corr_cmds and corr_cmds[0] != final_cmd:
-                                    _ok(f"Executor corrected → {corr_cmds[0]}")
-                                    exec_result2 = await shell.run(corr_cmds[0])
-                                    out2 = exec_result2.stdout or exec_result2.stderr or ""
-                                    final_cmd = corr_cmds[0]
-                                    if exec_result2.exit_code == 0:
-                                        _ok(f"Re-run exit=0  ({len(out2)} chars)")
-                                        tool_output = out2 or f"[{final_cmd}] exited 0 but produced no output."
-                                    else:
-                                        _warn(f"Re-run also failed — synthesising Python fallback")
-                                        tool_output = await _synthesise_fallback(
-                                            model, binary, final_cmd, out2, args.target, shell
-                                        )
-                                    if out2:
-                                        print("\n".join(f"    {l}" for l in out2.splitlines()[:30]))
-                                else:
-                                    _warn("Executor produced same command — synthesising Python fallback")
-                                    tool_output = await _synthesise_fallback(
-                                        model, binary, final_cmd, tool_output, args.target, shell
-                                    )
-                            except Exception as exc:
-                                _warn(f"Executor correction failed: {exc}")
-                except Exception as exc:
-                    _err(f"Execution error: {exc}")
-                    tool_output = f"ERROR: {exc}"
+            # ── 6. DISPATCH + EXECUTE via Tool Runtime ────────────────────────
+            if args.execute:
+                _hdr("EXECUTING via ToolDispatcher", "")
+                tool_results = await _dispatcher.execute_all(_disp_ctx)
             else:
                 _info("(--execute not set — skipping actual execution)")
-                tool_output = f"[DRY RUN] Would execute: {final_cmd}"
+                from pentestgpt.tools.base import ToolResult as _TR
+                tool_results = [
+                    _TR(
+                        success=True, exit_code=0,
+                        stdout=f"[DRY RUN] Would execute: {c}",
+                        stderr="", command_run=c, tool_name="shell_raw",
+                    )
+                    for c in (_preview_cmds or [f"# {response[:80]}"])
+                ]
 
-            # ── 7. ANALYST EXTRACTION ─────────────────────────────────────────
-            if "analyst" in model.loaded_adapters() and tool_output and len(tool_output) > 50:
-                _hdr("ANALYST — extracting structured findings", "analyst")
-                t0 = time.time()
-                findings = _analyst_extract(model, tool_output, args.target, min(args.max_tokens, 350))
-                elapsed = time.time() - t0
-                if findings:
-                    _ok(f"JSON extracted ({elapsed:.1f}s)  keys={list(findings.keys())}")
-                    # Ingest into knowledge store
-                    if knowledge:
+            # ── 7. POLICY + OBSERVATION ──────────────────────────────────────
+            _next_turns = _obs.summarize_batch(tool_results, state, _policy)
+            _combined_prompt = _obs.combined_prompt(_next_turns)
+
+            for res, nt in zip(tool_results, _next_turns):
+                sym = _ok if res.success else _warn
+                sym(
+                    f"[{res.tool_name}] exit={res.exit_code} "
+                    f"elapsed={res.elapsed_s:.1f}s "
+                    f"error_kind={res.error_kind or 'none'}"
+                )
+                if res.stdout.strip():
+                    lines = res.stdout.splitlines()
+                    print("\n".join(f"    {l}" for l in lines[:30]))
+                    if len(lines) > 30:
+                        _info(f"[…{len(lines)-30} more lines — full output: {nt.step_file}]")
+                elif res.stderr.strip():
+                    print(f"    {DIM}{res.stderr[:300]}{R}")
+
+                if nt.circuit_break:
+                    _warn(f"CIRCUIT BREAKER: {res.tool_name} — requesting pivot")
+
+            # ── 8. ANALYST EXTRACTION (gated by policy) ──────────────────────
+            _analyst_ran = False
+            for res, nt in zip(tool_results, _next_turns):
+                if nt.allow_analyst and "analyst" in model.loaded_adapters():
+                    _hdr("ANALYST — extracting structured findings", "analyst")
+                    t0 = time.time()
+                    findings = _analyst_extract(
+                        model, res.combined_output, args.target, min(args.max_tokens, 350)
+                    )
+                    elapsed = time.time() - t0
+                    if findings:
+                        _ok(f"JSON extracted ({elapsed:.1f}s)  keys={list(findings.keys())}")
+                        if knowledge:
+                            try:
+                                knowledge.ingest_structured(findings)
+                                _info("Knowledge store updated")
+                            except Exception:
+                                pass
+                        for key, val in findings.items():
+                            if isinstance(val, list) and val:
+                                print(f"    {DIM}{key}: {len(val)} items{R}")
+                            elif val:
+                                print(f"    {DIM}{key}: {str(val)[:80]}{R}")
+                        _analyst_ran = True
+                    else:
+                        _warn("Analyst returned no structured JSON — raw output kept")
+                    break   # only call analyst once per step
+
+            # Fall back to raw ingestion if analyst didn't run
+            if not _analyst_ran and knowledge:
+                for res in tool_results:
+                    raw = res.combined_output
+                    if raw and raw != "(no output)":
                         try:
-                            knowledge.ingest_structured(findings)
-                            _info("Knowledge store updated")
+                            knowledge.ingest_tool_output(raw)
                         except Exception:
                             pass
-                    # Print summary
-                    for key, val in findings.items():
-                        if isinstance(val, list) and val:
-                            print(f"    {DIM}{key}: {len(val)} items{R}")
-                        elif val:
-                            print(f"    {DIM}{key}: {str(val)[:80]}{R}")
-                else:
-                    _warn("Analyst returned no structured JSON — raw output kept")
+                        break
 
-            # ── 8. KNOWLEDGE UPDATE + NEXT PROMPT ────────────────────────────
-            # If analyst extraction failed or wasn't run, fall back to raw ingestion
-            if knowledge and not findings:
-                try:
-                    knowledge.ingest_tool_output(tool_output)
-                except Exception:
-                    pass
-
-            # Add turn to history
+            # Add turn to history (summary only — not raw blob)
             history.append({"role": "user",      "content": current_msg})
             history.append({"role": "assistant", "content": response})
-            if tool_output:
-                history.append({"role": "user",
-                                 "content": f"[Tool output]\n{tool_output[:800]}"})
+            if _combined_prompt:
+                history.append({"role": "user",  "content": _combined_prompt})
 
-            # Build next prompt from tool output
+            # Build next prompt using ObservationSummarizer output
             know_summary = knowledge.context_block()[:300] if knowledge else ""
             current_msg = (
-                f"Previous command: {final_cmd}\n\n"
-                f"Tool output (first 800 chars):\n{tool_output[:800]}\n\n"
-                + (f"Current knowledge:\n{know_summary}\n\n" if know_summary else "")
-                + f"Continue the engagement against {args.target}. "
+                _combined_prompt
+                + (f"\n\nCurrent knowledge:\n{know_summary}" if know_summary else "")
+                + f"\n\nContinue the engagement against {args.target}. "
                 f"Propose and execute the next highest-value action."
             )
 
-            # Advance phase based on tool output (uses built-in state machine)
-            if tool_output:
-                state.update_from_output(tool_output)
             _info(f"Phase: {state.phase.value}")
 
     except KeyboardInterrupt:

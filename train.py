@@ -167,8 +167,9 @@ SOURCE_MAP = {
     "executor":  ("processed/executor.jsonl",      "outputs/mythos-v4-executor",  10,   1024),  # command correction + output filtering
     "analyst":   ("processed/analyst.jsonl",       "outputs/mythos-v4-analyst",   10,   1024),  # HackerOne reports + tool interpretation
     "planner":   ("processed/planner.jsonl",       "outputs/mythos-v4-planner",    8,   1024),  # goal decomposition + replanning
-    "researcher":("processed/researcher.jsonl",    "outputs/mythos-v4-researcher", 4,   1024),  # novelty discovery (3 subtypes merged)
-    "combined":  ("processed/combined.jsonl",      "outputs/mythos-v4-combined",   3,   2048),
+    "researcher":   ("processed/researcher.jsonl",    "outputs/mythos-v4-researcher",    4,   1024),  # novelty discovery (3 subtypes merged)
+    "tool_operator":("processed/tool_operator.jsonl", "outputs/mythos-v4-tool_operator", 8,   1280),  # first-principles tool use + flag correction
+    "combined":     ("processed/combined.jsonl",      "outputs/mythos-v4-combined",      3,   2048),
 }
 
 # Resolve source: explicit --source wins; fall back to detecting from --data; else default
@@ -180,7 +181,7 @@ elif args.data:
     _epoch_default = 3
     _seq_default   = 3000
 else:
-    parser.error("Specify --source (exploitdb | htb | vulhub | attack | ad | webapp | osint | cloud | executor | analyst | planner | researcher | combined).")
+    parser.error("Specify --source (exploitdb | htb | vulhub | attack | ad | webapp | osint | cloud | executor | analyst | planner | researcher | tool_operator | combined).")
 
 DATA_PATH   = args.data   or _data_default
 OUTPUT_DIR  = args.output or _out_default

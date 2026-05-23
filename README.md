@@ -470,3 +470,68 @@ All 12 adapters verified:
 - ✅ BB phase routing covers all 9 phases with correct adapter assignments
 - ✅ Token-budget context assembly prevents context overflow
 - ✅ Engagement knowledge persists and restores across sessions
+
+---
+
+## Native Tool Runtime Layer
+
+The tool runtime layer sits between adapter output and the shell, enforcing correctness and truthfulness at the execution boundary.
+
+### Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| `ToolResult` | `tools/base.py` | Standard return shape for every tool execution |
+| `EnvManifest` | `tools/env_manifest.py` | Session-start environment detection + binary collision resolution |
+| Typed wrappers | `tools/pentest_tools.py` | 8 wrappers: `nmap_scan`, `curl_probe`, `subfinder_enum`, `gau_urls`, `probe_http`, `ffuf_dirs`, `gobuster_dir`, `run_python` |
+| `ToolDispatcher` | `tools/dispatcher.py` | Translates model `<command>` output → typed wrapper calls; preflight tool_operator for ambiguous binaries |
+| `ExecutionPolicy` | `core/execution_policy.py` | Fail-closed rules: flag errors, empty output, circuit breaker, analyst gating |
+| `ObservationSummarizer` | `core/observation.py` | Compact per-step prompts (~150–300 tokens) + full output saved to `workspace/observations/` |
+
+### Key properties
+
+- **Binary collision detection**: `EnvManifest` distinguishes Python `httpx` from ProjectDiscovery `httpx`. The `probe_http` wrapper always uses the PD binary path, or falls back to a `curl` loop — it never calls bare `httpx`.
+- **No invented flags**: `gau_urls` always passes the domain as a positional argument (not `-d`). `subfinder_enum` always uses `-d`. Every wrapper was built from tested flag patterns.
+- **Fail-closed**: `ExecutionPolicy` ensures that `exit_code != 0`, empty stdout, or env errors (Python tracebacks) **cannot** advance the engagement phase or reach the analyst adapter.
+- **Compact context**: `ObservationSummarizer` injects a 150–300 token summary into the next model turn instead of raw tool blobs. Full output is saved to disk for debugging.
+
+### Training `tool_operator`
+
+```bash
+# Generate training data (uses real --help output from installed tools)
+python3 src/source15_tool_operator.py
+
+# Process into training format
+python3 prepare_data.py --source tool_operator
+
+# Train the adapter (requires GPU)
+python3 train.py --source tool_operator
+```
+
+### CTF Validation Ladder
+
+Use this progression to validate before returning to real-world bug bounty:
+
+**Step 1 — Unit tests (no GPU)**
+```bash
+python3 test_adapter_flow.py --tool-runtime-test
+```
+Verifies: manifest detection, gau routing, policy gating, phase hold on empty output, compact summarizer prompts. All 5 checks must pass.
+
+**Step 2 — Vulhub Docker (Log4Shell)**
+```bash
+# In one terminal: spin up the target
+docker-compose -f vulhub/log4j/CVE-2021-44228/docker-compose.yml up -d
+
+# In another: run Mythos
+python3 run.py --target 127.0.0.1:8080 --execute
+```
+Success metric: Mythos identifies Log4Shell, proposes a valid `${jndi:ldap://…}` payload, and executes without hallucinating flags or fabricating output.
+
+**Step 3 — HTB retired easy box (VPN required)**
+```bash
+python3 run.py --target <box-ip> --execute
+```
+Success metric: Score ≥ 3 — vulnerability correctly identified + at least one valid command executed per phase.
+
+Only proceed to live bug bounty after scoring ≥ 3 on an HTB easy box.

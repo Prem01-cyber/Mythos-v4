@@ -79,22 +79,25 @@ SOURCES = [
     ("raw/planner_replan.jsonl",      "planner",   1024, "processed/planner_replan.jsonl"),
     ("raw/researcher_synth.jsonl",    "researcher",1024, "processed/researcher_synth.jsonl"),
     ("raw/researcher_pz.jsonl",       "researcher",1024, "processed/researcher_pz.jsonl"),
-    ("raw/researcher_ctf.jsonl",      "researcher",1024, "processed/researcher_ctf.jsonl"),
+    ("raw/researcher_ctf.jsonl",      "researcher",   1024, "processed/researcher_ctf.jsonl"),
+    # tool_operator: first-principles tool usage, flag correction, Python synthesis
+    ("raw/tool_operator.jsonl",       "tool_operator", 1280, "processed/tool_operator.jsonl"),
 ]
 
 SOURCE_FILTER = {
-    "exploitdb": 0,
-    "htb":       1,
-    "vulhub":    2,
-    "attack":    3,
-    "ad":        4,
-    "webapp":    5,
-    "osint":     6,
-    "cloud":     7,
-    "executor":  8,
-    "analyst":   9,
-    "planner":   10,
-    "researcher":11,
+    "exploitdb":    0,
+    "htb":          1,
+    "vulhub":       2,
+    "attack":       3,
+    "ad":           4,
+    "webapp":       5,
+    "osint":        6,
+    "cloud":        7,
+    "executor":     8,
+    "analyst":      9,
+    "planner":      10,
+    "researcher":   11,
+    "tool_operator":12,
 }
 
 OUTPUT_PATH = "processed/combined.jsonl"

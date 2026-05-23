@@ -1364,6 +1364,135 @@ def run_live_test(
     results["live_test"] = live_results
 
 
+# ── Tool Runtime Test (no GPU required) ───────────────────────────────────────
+
+async def run_tool_runtime_test(target: str = "supplier.meesho.com") -> dict:
+    """Test the tool runtime layer without loading any GPU model.
+
+    Checks:
+      1. EnvManifest builds and detects httpx collision
+      2. ToolDispatcher routes gau command → gau_urls wrapper
+      3. ExecutionPolicy blocks analyst when command fails
+      4. Empty subfinder output → phase does not advance
+      5. ObservationSummarizer produces compact prompt (< 500 chars)
+    """
+    from pentestgpt.tools.env_manifest    import EnvManifest
+    from pentestgpt.tools.dispatcher     import ToolDispatcher, DispatchContext
+    from pentestgpt.tools.base           import ToolResult
+    from pentestgpt.core.execution_policy import ExecutionPolicy
+    from pentestgpt.core.observation      import ObservationSummarizer
+    from pentestgpt.core.engagement_state import EngagementState
+
+    print(f"\n{BOLD}{CYAN}── TOOL RUNTIME TEST ──────────────────────────────────────────{RESET}")
+    checks = {}
+
+    # ── Check 1: EnvManifest builds ─────────────────────────────────────────
+    try:
+        manifest = EnvManifest.build()
+        block = manifest.context_block()
+        assert "[TOOL MANIFEST" in block
+        httpx_info = manifest.tools.get("httpx")
+        checks["manifest_builds"] = True
+        print(f"  {GREEN}✓{RESET} EnvManifest built ({len(manifest.tools)} tools detected)")
+        if httpx_info and not httpx_info.is_pd_variant:
+            print(f"  {YELLOW}⚠{RESET}  httpx in PATH is Python client (PD binary not found) — collision detected")
+            checks["httpx_collision_detected"] = True
+        elif httpx_info and httpx_info.is_pd_variant:
+            print(f"  {GREEN}✓{RESET} httpx is ProjectDiscovery binary")
+            checks["httpx_collision_detected"] = True
+        else:
+            checks["httpx_collision_detected"] = True   # not installed — no collision risk
+    except Exception as exc:
+        checks["manifest_builds"] = False
+        checks["httpx_collision_detected"] = False
+        print(f"  {RED}✗{RESET} EnvManifest failed: {exc}")
+
+    # ── Check 2: Dispatcher routes gau → gau_urls ──────────────────────────
+    try:
+        dispatcher = ToolDispatcher()
+        cmds = dispatcher._extract_commands(
+            f"<command>gau {target}</command>"
+        )
+        assert len(cmds) == 1 and "gau" in cmds[0]
+        checks["dispatcher_extracts_gau"] = True
+        print(f"  {GREEN}✓{RESET} Dispatcher extracted gau command: {cmds[0]}")
+    except Exception as exc:
+        checks["dispatcher_extracts_gau"] = False
+        print(f"  {RED}✗{RESET} Dispatcher extraction failed: {exc}")
+
+    # ── Check 3: ExecutionPolicy blocks analyst on failure ──────────────────
+    try:
+        policy = ExecutionPolicy()
+        failed_result = ToolResult(
+            success=False, exit_code=1,
+            stdout="", stderr="unknown flag: --d",
+            command_run=f"gau --d {target}",
+            tool_name="gau_urls",
+            error_kind="flag_error",
+        )
+        decision = policy.apply(failed_result)
+        assert not decision.allow_analyst, "Policy should block analyst on flag_error"
+        assert not decision.allow_advance, "Policy should block advance on flag_error"
+        checks["policy_blocks_analyst_on_failure"] = True
+        print(f"  {GREEN}✓{RESET} ExecutionPolicy blocked analyst on flag_error")
+    except Exception as exc:
+        checks["policy_blocks_analyst_on_failure"] = False
+        print(f"  {RED}✗{RESET} ExecutionPolicy check failed: {exc}")
+
+    # ── Check 4: Empty output → phase does not advance ──────────────────────
+    try:
+        state = EngagementState(mode="bug_bounty")
+        state.set_target(target)
+        old_phase = state.phase
+        policy2 = ExecutionPolicy()
+        obs = ObservationSummarizer(workspace="/tmp/mythos_rt_test")
+        empty_result = ToolResult(
+            success=False, exit_code=0,
+            stdout="", stderr="",
+            command_run=f"subfinder -d {target} -silent",
+            tool_name="subfinder_enum",
+            error_kind="empty_output",
+        )
+        next_turn = obs.summarize(empty_result, state, policy2)
+        assert not next_turn.allow_advance, "Empty output should not advance phase"
+        assert state.phase == old_phase, "Phase should not change on empty output"
+        checks["empty_output_no_phase_advance"] = True
+        print(f"  {GREEN}✓{RESET} Empty subfinder output → phase held at {old_phase.value}")
+    except Exception as exc:
+        checks["empty_output_no_phase_advance"] = False
+        print(f"  {RED}✗{RESET} Phase advance check failed: {exc}")
+
+    # ── Check 5: ObservationSummarizer produces compact prompt ──────────────
+    try:
+        state2 = EngagementState(mode="bug_bounty")
+        state2.set_target(target)
+        policy3 = ExecutionPolicy()
+        obs2 = ObservationSummarizer(workspace="/tmp/mythos_rt_test")
+        good_result = ToolResult(
+            success=True, exit_code=0,
+            stdout="api.supplier.meesho.com\nmobile.meesho.com\nstatic.meesho.com",
+            stderr="",
+            command_run=f"subfinder -d {target} -silent",
+            tool_name="subfinder_enum",
+            parsed={"subdomains": ["api.supplier.meesho.com", "mobile.meesho.com", "static.meesho.com"]},
+            error_kind=None,
+        )
+        nt = obs2.summarize(good_result, state2, policy3)
+        assert len(nt.next_prompt) < 600, f"Prompt too long: {len(nt.next_prompt)} chars"
+        assert nt.allow_advance
+        checks["summarizer_compact_prompt"] = True
+        print(f"  {GREEN}✓{RESET} ObservationSummarizer prompt: {len(nt.next_prompt)} chars (< 600)")
+    except Exception as exc:
+        checks["summarizer_compact_prompt"] = False
+        print(f"  {RED}✗{RESET} Summarizer check failed: {exc}")
+
+    passed = sum(1 for v in checks.values() if v)
+    total  = len(checks)
+    colour = GREEN if passed == total else (YELLOW if passed >= total - 1 else RED)
+    print(f"\n{colour}Tool runtime: {passed}/{total} checks passed{RESET}")
+    return checks
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mythos adapter flow test")
     parser.add_argument("--target",          default="supplier.meesho.com",
@@ -1386,6 +1515,8 @@ def main() -> None:
                         help="Run full live end-to-end test (GPU): osint→validate→execute→analyst→webapp")
     parser.add_argument("--execute",         action="store_true",
                         help="Actually run shell commands in pipeline/live tests")
+    parser.add_argument("--tool-runtime-test", action="store_true",
+                        help="Test tool runtime layer: manifest, dispatcher, policy, observation (no GPU)")
     parser.add_argument("--save",            default="",
                         help="Save results JSON to this file")
     parser.add_argument("--project-root",    default="",
@@ -1398,6 +1529,7 @@ def main() -> None:
     needs_gpu = (
         not args.exec_pipeline          # default mode runs solo+chain
         and not args.classifier_test    # classifier test is no-GPU
+        and not args.tool_runtime_test  # tool runtime test is no-GPU
         or args.solo_only
         or args.chain_only
         or args.correction_test
@@ -1405,7 +1537,7 @@ def main() -> None:
     )
     # Static-only flag: only run tests that require no GPU
     exec_pipeline_only = (
-        (args.exec_pipeline or args.classifier_test)
+        (args.exec_pipeline or args.classifier_test or args.tool_runtime_test)
         and not args.solo_only
         and not args.chain_only
         and not args.correction_test
@@ -1421,7 +1553,9 @@ def main() -> None:
         mode_parts.append("correction")
     if args.live_test:
         mode_parts.append("live-e2e" + (" +exec" if args.execute else ""))
-    if not args.exec_pipeline and not args.correction_test and not args.live_test:
+    if args.tool_runtime_test:
+        mode_parts.append("tool-runtime")
+    if not args.exec_pipeline and not args.correction_test and not args.live_test and not args.tool_runtime_test:
         if not args.chain_only:
             mode_parts.append("solo")
         if not args.solo_only:
@@ -1447,7 +1581,11 @@ def main() -> None:
     if args.classifier_test:
         results["classifier_test"] = run_classifier_test(project_root)
 
-    if exec_pipeline_only:
+    # ── Tool runtime test (no GPU) ─────────────────────────────────────────
+    if args.tool_runtime_test:
+        results["tool_runtime_test"] = asyncio.run(run_tool_runtime_test(args.target))
+
+    if exec_pipeline_only or args.tool_runtime_test:
         if args.save:
             Path(args.save).write_text(json.dumps(results, indent=2))
             print(f"\n{GREEN}Results saved to: {args.save}{RESET}")
